@@ -132,6 +132,21 @@ class detector():
                 detections.confidence = detections.confidence[valid_idx]
                 detections.class_id = detections.class_id[valid_idx]
                 # print("Sept30 ",len(detections), detections.class_id)
+
+                # Clamp to image bounds and drop boxes that are degenerate
+                # after clamping. GDINO occasionally emits inverted or
+                # out-of-image boxes that survive NMS but crash downstream
+                # image.crop() (right < left).
+                H, W = image.shape[:2]
+                xyxy = detections.xyxy.copy()
+                xyxy[:, 0] = np.clip(xyxy[:, 0], 0, W)
+                xyxy[:, 2] = np.clip(xyxy[:, 2], 0, W)
+                xyxy[:, 1] = np.clip(xyxy[:, 1], 0, H)
+                xyxy[:, 3] = np.clip(xyxy[:, 3], 0, H)
+                valid_box = (xyxy[:, 2] > xyxy[:, 0]) & (xyxy[:, 3] > xyxy[:, 1])
+                detections.xyxy = xyxy[valid_box]
+                detections.confidence = detections.confidence[valid_box]
+                detections.class_id = detections.class_id[valid_box]
             # detection_time += (time.perf_counter_ns() - detection_start)
             return detections
                 # # Somehow some detections will have class_id=-None, remove them

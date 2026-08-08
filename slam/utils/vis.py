@@ -265,12 +265,13 @@ def vis_result_slow_caption(image, masks, boxes_filt, pred_phrases, caption, tex
     plt.title('Tagging-Caption: ' + caption + '\n' + 'Tagging-classes: ' + text_prompt + '\n')
     plt.axis('off')
     
-    # Convert the fig to a numpy array
+    # Convert the fig to a numpy array. ``tostring_rgb`` was removed in
+    # matplotlib 3.10; ``buffer_rgba`` is the replacement and returns a
+    # (H, W, 4) memoryview that we copy and drop the alpha channel from.
     fig = plt.gcf()
     fig.tight_layout(pad=0)
     fig.canvas.draw()
-    vis_image = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    vis_image = vis_image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    vis_image = np.array(fig.canvas.buffer_rgba())[..., :3]
     plt.close()
     
     return vis_image

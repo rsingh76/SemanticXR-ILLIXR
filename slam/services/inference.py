@@ -101,8 +101,26 @@ def inference_consumer(inferenceQueue,
         if isinstance(queue_item, dict) and queue_item.get('type') == 'scene_completion':
             scene_name = queue_item['scene_name']
             print(f"🎯 [INFERENCE] Received scene completion signal for {scene_name}")
-            print(f"🧹 [INFERENCE] Scene completed - forwarding to mapping (no state to clear here)")
-            
+
+            # Snapshot accumulated RAM/GDINO classes for the dump in mapping_server,
+            # then clear so the next session starts with an empty tag pool. Without
+            # this, captioning_model.global_classes accumulates forever and
+            # subsequent clients' GDINO prompts contain every tag ever seen.
+            if useDetector:
+                if captioning_model.global_classes:
+                    queue_item['scene_classes'] = list(captioning_model.global_classes)
+                captioning_model.global_classes.clear()
+                captioning_model.classes = None
+                print(f"🧹 [INFERENCE] Cleared captioning state for next scene")
+
+            # Re-bind run dir for the next session. Each child process holds its
+            # own copy of the env var, so we update it here for any future
+            # dump_inference_results calls inside this process.
+            new_run_dir = queue_item.get('run_output_dir')
+            if new_run_dir:
+                os.environ['SLAM_RUN_OUTPUT_DIR'] = new_run_dir
+                print(f"🔄 [INFERENCE] Run dir → {new_run_dir}")
+
             # Forward completion signal to mapping queue
             mappingQueue.put(queue_item)
             continue
@@ -113,7 +131,9 @@ def inference_consumer(inferenceQueue,
             mappingQueue.put(queue_item)  # Forward to mapping
             break
             
-        image_pil, image_cv2_bgr, depth_array, pose_array, frameNumber, starting_timestamp, clientTimeStamps, time_dict = queue_item
+        # 9-slot tuple: slot 9 is the session-level depth cap (Optional[float]).
+        # See server/components/inference_service.py::submit_inference_request.
+        image_pil, image_cv2_bgr, depth_array, pose_array, frameNumber, starting_timestamp, clientTimeStamps, time_dict, max_depth_m = queue_item
         # convert the frame to a numpy array
         # pass the numpy array to the model
         # get the results from the model
@@ -185,7 +205,9 @@ def inference_consumer(inferenceQueue,
             skipped_frames += 1
             print(f"⚠️  [INFERENCE→MAPPING] Queue full! Dropping frame {frameNumber}. Total skipped: {skipped_frames}")
             continue
-        queue_sending_item = (results, depth_array, pose_array, frameNumber, image_pil, classes, starting_timestamp, clientTimeStamps, time_dict)
+        # Slot 10 (last): forwards the session-level depth cap (Optional[float])
+        # to mapping_server, mirroring the 9th slot from the upstream queue.
+        queue_sending_item = (results, depth_array, pose_array, frameNumber, image_pil, classes, starting_timestamp, clientTimeStamps, time_dict, max_depth_m)
         mappingQueue.put(queue_sending_item)
         
         

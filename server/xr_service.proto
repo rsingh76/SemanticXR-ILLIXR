@@ -49,6 +49,11 @@ message UpstreamSyncMessage {
   repeated float depthArr = 2 [packed=true];
   PoseData pose = 3;
   int32 fps = 4;
+  // Per-session mapping depth cap (meters). 0.0 / unset = use server default
+  // from config (model.mapping.max_depth_m); <0 = explicit no-cap; >0 = cap
+  // value in meters. Client is expected to stamp the same value on every
+  // frame in a session (server logs it once on session start / on change).
+  float max_depth_m = 5;
 }
 
 message UpstreamSyncMessage_dataset {
@@ -59,9 +64,64 @@ message UpstreamSyncMessage_dataset {
   int32 fps = 4;
   int32 scaling_factor = 5;
   int64 timestamp_ns = 6;
+  // See UpstreamSyncMessage.max_depth_m for semantics.
+  float max_depth_m = 7;
+}
+
+message CameraIntrinsics {
+  float fx = 1;
+  float fy = 2;
+  float cx = 3;
+  float cy = 4;
+}
+
+message UpstreamSyncMessage_quest {
+  VideoFrame image = 1;
+  // Depth bytes: raw R16G16B16A16_SFloat texture data from
+  // _PreprocessedEnvironmentDepthTexture (8 bytes/pixel, 4 half-floats per pixel).
+  // Channels: R = 1.0 - minAvg, G = 1.0 - maxAvg, B = avg - minAvg, A = maxAvg - minAvg
+  // Recover linear depth (meters): depth = nearZ / R_channel
+  bytes depth = 2;
+  // Field 3 was 'pose' (head pose), now superseded by head_pose / rgb_camera_pose / depth_pose.
+  // Kept as field 3 = head pose for backward compat with current server.
+  repeated float pose = 3 [packed=true];          // DEPRECATED alias of head_pose, 4x4 RH
+  CameraIntrinsics intrinsics = 4;                // RGB camera intrinsics
+  int32 image_width = 5;
+  int32 image_height = 6;
+  int32 depth_width = 7;
+  int32 depth_height = 8;
+  int32 fps = 9;
+  int64 timestamp_ns = 10;                        // Unity render time at capture (nanoseconds, NOT a sensor clock)
+  float depth_near_z = 11;
+  float depth_far_z = 12;
+  CameraIntrinsics depth_intrinsics = 13;         // Derived from depth FOV tangents (pinhole model)
+  repeated float depth_pose = 14 [packed=true];   // 4x4 depth camera-to-world (RH, OpenXR tracking space)
+
+  // ---- Synchronization & explicit poses (added for proper RGB/depth alignment) ----
+  // RGB sensor timestamp from Android Camera2 SENSOR_TIMESTAMP (CLOCK_BOOTTIME nanoseconds).
+  // 0 if PassthroughCameraAccess timestamp unavailable.
+  int64 rgb_timestamp_ns = 15;
+  // Depth frame createTime from EnvironmentDepthFrameDesc.createTime (XrTime / CLOCK_MONOTONIC nanoseconds).
+  // Only populated when OVRCameraRig is in the scene; 0 otherwise (Meta SDK quirk).
+  // NOTE: rgb_timestamp_ns and depth_timestamp_ns are in DIFFERENT clock domains (BOOTTIME vs MONOTONIC).
+  // They must be offset-corrected before comparison (offset = time spent in suspend since boot).
+  int64 depth_timestamp_ns = 16;
+  // Head pose: Camera.main eye-center transform at capture time, 4x4 RH (Unity world space).
+  repeated float head_pose = 17 [packed=true];
+  // RGB camera pose: from PassthroughCameraAccess.GetCameraPose() — physical camera sensor with lens offset
+  // applied, computed at the RGB capture timestamp. 4x4 RH (Unity world space).
+  repeated float rgb_camera_pose = 18 [packed=true];
+  // Raw depth FOV tangents (left, right, top, down) from EnvironmentDepthFrameDesc.
+  // The depth_intrinsics field is derived from these via the standard pinhole model.
+  // Storing both lets the server verify the conversion or use a non-pinhole model if desired.
+  repeated float depth_fov_tangents = 19 [packed=true];
+
+  // See UpstreamSyncMessage.max_depth_m for semantics.
+  float max_depth_m = 20;
 }
 
 service XrService {
   rpc UploadSyncMessage_dataset(stream UpstreamSyncMessage_dataset) returns (VideoStatus) {}
   rpc UploadSyncMessage(stream UpstreamSyncMessage) returns (VideoStatus) {}
+  rpc UploadSyncMessage_quest(stream UpstreamSyncMessage_quest) returns (VideoStatus) {}
 }

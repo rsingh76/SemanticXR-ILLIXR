@@ -30,6 +30,110 @@ from config.settings import get_config
 
 experiment_config = None
 
+# Canonical list of "background" semantic classes: fused into the map as a
+# single per-class bg object when cfg.skip_bg is False. Re-exported from
+# slam.utils.mapping_utils for back-compat. Distinct from cfg.ignore_classes
+# (which drops masks entirely — see filter_gobs).
+BG_CLASSES = ["wall", "floor", "ceiling"]
+
+# Per-process state for the CLIP-similarity ignore filter. Populated once at
+# mapping/inference consumer startup by configure_ignore_clip_filter(); read
+# per-frame inside filter_gobs() when cfg.skip_ignored_clip is True.
+# text_feats: [N_ignore, D] torch.Tensor, L2-normalized in float32. Lives in
+# the same CLIP embedding space as gobs['image_feats'] (see model_utils.py).
+_IGNORE_CLIP_STATE: dict = {"text_feats": None, "threshold": 0.28}
+
+
+def configure_ignore_clip_filter(text_feats, threshold: float = 0.28) -> None:
+    """Cache pre-encoded CLIP text embeddings for the ignore-class filter.
+
+    Called once per process at startup with the L2-normalized text features
+    of cfg.ignore_classes. filter_gobs() then dot-products them against each
+    mask's gobs['image_feats'] and drops masks whose max similarity exceeds
+    `threshold` — a class-name-free way to drop humans (or anything else).
+    """
+    _IGNORE_CLIP_STATE["text_feats"] = text_feats
+    _IGNORE_CLIP_STATE["threshold"] = float(threshold)
+
+
+def reset_ignore_clip_filter() -> None:
+    """Disable the CLIP ignore filter for this process (used in tests / teardown)."""
+    _IGNORE_CLIP_STATE["text_feats"] = None
+
+
+def compute_clip_ignore_drops(img_feats):
+    """Return (drop_mask, max_sims) for a batch of CLIP image embeddings.
+
+    img_feats: [N, D] or [D] numpy array or torch tensor, L2-normalized in the
+    same CLIP space as _IGNORE_CLIP_STATE['text_feats'].
+    Returns (None, None) if the filter isn't armed or there's nothing to score.
+
+    Shared by filter_gobs() (pipelined path, gobs already carries feats) and
+    filter_detections_clip_ignore() (non-pipelined path, feats are attached to
+    each detection AFTER filter_gobs has run).
+    """
+    text_feats = _IGNORE_CLIP_STATE["text_feats"]
+    if text_feats is None or img_feats is None or len(img_feats) == 0:
+        return None, None
+    if not isinstance(img_feats, torch.Tensor):
+        img_feats_t = torch.as_tensor(img_feats, dtype=text_feats.dtype, device=text_feats.device)
+    else:
+        img_feats_t = img_feats.to(dtype=text_feats.dtype, device=text_feats.device)
+    if img_feats_t.dim() == 1:
+        img_feats_t = img_feats_t.unsqueeze(0)
+    sims = img_feats_t @ text_feats.T                                       # [N, N_ignore]
+    max_sims, _ = sims.max(dim=-1)
+    drop = (max_sims > _IGNORE_CLIP_STATE["threshold"]).cpu().numpy()
+    return drop, max_sims.detach().cpu().numpy()
+
+
+def filter_detections_clip_ignore(cfg: DictConfig, fg_detection_list, bg_detection_list):
+    """Drop detections whose CLIP image embedding matches an ignore-class text embedding.
+
+    Counterpart to filter_gobs's CLIP-ignore block for the non-pipelined path:
+    there, filter_gobs runs in a sibling thread before CLIP has completed, so
+    gobs['image_feats'] is None when filter_gobs inspects it and that block is
+    a no-op. By the time this function is called, clip_ft has been attached
+    to each detection — so we can run the same drop logic on each det's
+    already-attached feature.
+
+    Returns new (fg_detection_list, bg_detection_list) with matching dets
+    removed. Safe to call when the filter is disarmed or empty (returns inputs
+    unchanged). Caller should pass the root cfg (for skip_ignored_clip /
+    debug_ignore_drops flags). Uses compute_clip_ignore_drops() so tuning the
+    threshold in one place affects both paths.
+    """
+    if not bool(cfg.get('skip_ignored_clip', False)):
+        return fg_detection_list, bg_detection_list
+    if len(fg_detection_list) == 0 and len(bg_detection_list) == 0:
+        return fg_detection_list, bg_detection_list
+
+    all_dets = list(fg_detection_list) + list(bg_detection_list)
+    clip_fts = [obj.get('clip_ft') for obj in all_dets]
+    if not all(ft is not None for ft in clip_fts):
+        return fg_detection_list, bg_detection_list
+
+    stacked = torch.stack([ft.view(-1) for ft in clip_fts])
+    drop, sims = compute_clip_ignore_drops(stacked)
+    if drop is None or not drop.any():
+        return fg_detection_list, bg_detection_list
+
+    n_fg = len(fg_detection_list)
+    fg_keep = [i for i in range(n_fg) if not drop[i]]
+    bg_keep = [i for i in range(len(bg_detection_list)) if not drop[n_fg + i]]
+
+    if bool(cfg.get('debug_ignore_drops', False)):
+        dropped_info = [
+            (all_dets[i].get('class_name', ['?'])[0], round(float(sims[i]), 3))
+            for i in range(len(drop)) if drop[i]
+        ]
+        print(f"[clip_ignore] dropped {int(drop.sum())} detection(s): {dropped_info}")
+
+    return (
+        DetectionList([fg_detection_list[i] for i in fg_keep]),
+        DetectionList([bg_detection_list[i] for i in bg_keep]),
+    )
+
 def get_classes_colors(classes):
     class_colors = {}
 
@@ -194,7 +298,7 @@ def pcd_denoise_dbscan(pcd: o3d.geometry.PointCloud, eps=0.02, min_points=10) ->
     return pcd
 
 def process_pcd(pcd, cfg, run_dbscan=True, frameNumer = None, caller=None, dataset_type='replica', time_dict=None):  
-    voxel_size = cfg.downsample_voxel_size
+    voxel_size = cfg.dataset_config.downsample_voxel_size
     downsample_start = time.perf_counter_ns()
     pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
     
@@ -205,7 +309,7 @@ def process_pcd(pcd, cfg, run_dbscan=True, frameNumer = None, caller=None, datas
     if experiment_config is None:
         raise ValueError("Experiment config is not set")
     object_based_downsampling = experiment_config.model.mapping.object_based_downsampling
-    if dataset_type in ['replica', 'scannet'] and object_based_downsampling:
+    if dataset_type in ['replica', 'scannet', 'quest'] and object_based_downsampling:
         while len(pcd.points) > 2000:
             voxel_size *= cfg.dataset_config.mapping.object_based_downsampling
             pcd = pcd.voxel_down_sample(voxel_size=voxel_size)
@@ -384,6 +488,19 @@ def compute_overlap_matrix_2set(cfg, objects_map: MapObjectList, objects_new: De
 
     return overlap_matrix
 
+def _summarize_obj_texts(obj) -> str:
+    # Compact description of an object's text labels (class_name list + caption dict values),
+    # deduped while preserving order. Used for merge-event logging in merge_overlap_objects.
+    parts = []
+    for x in (obj.get('class_name') or []):
+        if x and x not in parts:
+            parts.append(str(x))
+    cap = obj.get('caption') or {}
+    for v in cap.values():
+        if v and v not in parts:
+            parts.append(str(v))
+    return "[" + " | ".join(parts) + "]" if parts else "<no-text>"
+
 def merge_overlap_objects(cfg, objects: MapObjectList, overlap_matrix: np.ndarray, history_map: dict):
     x, y = overlap_matrix.nonzero()
     overlap_ratio = overlap_matrix[x, y]
@@ -394,6 +511,11 @@ def merge_overlap_objects(cfg, objects: MapObjectList, overlap_matrix: np.ndarra
     x = x[sort]
     y = y[sort]
     overlap_ratio = overlap_ratio[sort]
+
+    # Snapshot original text descriptions before any merging mutates objects in-place.
+    obj_descs = [_summarize_obj_texts(obj) for obj in objects]
+    # target_idx -> {'target': desc, 'sources': [desc, ...]}; chains hoist sources up.
+    merge_events: dict = {}
 
     kept_objects = np.ones(len(objects), dtype=bool)
     for i, j, ratio in zip(x, y, overlap_ratio):
@@ -415,6 +537,17 @@ def merge_overlap_objects(cfg, objects: MapObjectList, overlap_matrix: np.ndarra
                     history_map[objects[i]['history_idx']] = None
                     removed_objects.append(objects[i]['history_idx'])
                     edited_objects.append(objects[j]['history_idx'])
+                    # Record this merge before mutating: if i was previously a target, hoist its
+                    # sources into j so the whole chain prints on one line.
+                    sources_to_add = []
+                    prior = merge_events.pop(int(i), None)
+                    if prior:
+                        sources_to_add.extend(prior['sources'])
+                    sources_to_add.append(obj_descs[int(i)])
+                    if int(j) in merge_events:
+                        merge_events[int(j)]['sources'].extend(sources_to_add)
+                    else:
+                        merge_events[int(j)] = {'target': obj_descs[int(j)], 'sources': sources_to_add}
                     objects[j] = merge_obj2_into_obj1(cfg, objects[j], objects[i], run_dbscan=True)
                     kept_objects[i] = False
         else:
@@ -433,8 +566,8 @@ def merge_overlap_objects(cfg, objects: MapObjectList, overlap_matrix: np.ndarra
             assert history_map[obj['history_idx']] == None, "The object should have been removed"
     # new_objects = [obj for obj, keep in zip(objects, kept_objects) if keep]
     objects = MapObjectList(new_objects)
-    
-    return objects, removed_objects, edited_objects, history_map
+
+    return objects, removed_objects, edited_objects, history_map, merge_events
 
 def denoise_objects(cfg, objects: MapObjectList):
     for i in range(len(objects)):
@@ -491,32 +624,69 @@ def merge_objects(cfg, objects: MapObjectList, history_map: dict):
         # Merge one object into another if the former is contained in the latter
         overlap_matrix = compute_overlap_matrix(cfg, objects)
         print("Before merging:", len(objects))
-        objects,removed_objects, edited_objects, history_map = merge_overlap_objects(cfg, objects, overlap_matrix, history_map=history_map)
+        objects, removed_objects, edited_objects, history_map, merge_events = merge_overlap_objects(cfg, objects, overlap_matrix, history_map=history_map)
         print("After merging:", len(objects))
-    
+        for ev in merge_events.values():
+            print(f"  {ev['target']} <- {', '.join(ev['sources'])}")
+
     return objects, removed_objects, edited_objects, history_map
 
 def filter_gobs(
     cfg: DictConfig,
     gobs: dict,
     image: np.ndarray,
-    BG_CLASSES = ["wall", "floor", "ceiling"],
+    BG_CLASSES=BG_CLASSES,
     pipelined_mapping=True,
 ):
     # If no detection at all
     if len(gobs['xyxy']) == 0:
         return gobs
-    
+
+    # Ignore list (string-match): classes to drop entirely (never mapped,
+    # never fused). Distinct from BG_CLASSES — BG classes are fused as a
+    # single bg object when skip_bg is false; ignored classes are discarded.
+    skip_ignored = bool(cfg.get('skip_ignored', False))
+    ignore_classes = set(cfg.get('ignore_classes', []) or []) if skip_ignored else set()
+
+    # Ignore filter (CLIP-similarity variant): drop masks whose CLIP image
+    # embedding is close to any pre-encoded ignore-class text embedding.
+    # Only fires when gobs arrives here with image_feats populated (pipelined
+    # mapping path — inference.py stashes feats into gobs before sending to
+    # the mapping queue). In the non-pipelined path (inference_pipeline.py),
+    # filter_gobs runs in parallel with CLIP so image_feats is None here;
+    # that path applies the CLIP-ignore filter post-hoc on each detection's
+    # clip_ft AFTER attachment — see inference_consumer().
+    clip_drop_mask = None
+    if bool(cfg.get('skip_ignored_clip', False)):
+        clip_drop_mask, max_sims_np = compute_clip_ignore_drops(gobs.get('image_feats'))
+        if clip_drop_mask is not None and clip_drop_mask.any() and bool(cfg.get('debug_ignore_drops', False)):
+            dropped_labels = [
+                gobs['classes'][gobs['class_id'][i]]
+                for i in range(len(clip_drop_mask)) if clip_drop_mask[i]
+            ]
+            dropped_sims = [round(float(max_sims_np[i]), 3)
+                            for i in range(len(clip_drop_mask)) if clip_drop_mask[i]]
+            print(f"[filter_gobs] CLIP-ignored {int(clip_drop_mask.sum())} mask(s): "
+                  f"labels={dropped_labels} max_sims={dropped_sims}")
+
     # Filter out the objects based on various criteria
     idx_to_keep = []
     for mask_idx in range(len(gobs['xyxy'])):
         local_class_id = gobs['class_id'][mask_idx]
         class_name = gobs['classes'][local_class_id]
-        
+
+        # CLIP-similarity ignore filter (vectorized above)
+        if clip_drop_mask is not None and clip_drop_mask[mask_idx]:
+            continue
+
+        # Drop ignored classes outright (e.g. humans for SemanticXR demos)
+        if ignore_classes and class_name in ignore_classes:
+            continue
+
         # SKip masks that are too small
         if gobs['mask'][mask_idx].sum() < max(cfg.mask_area_threshold, 10):
             continue
-        
+
         # Skip the BG classes
         if cfg.skip_bg and class_name in BG_CLASSES:
             continue
@@ -590,7 +760,7 @@ def gobs_to_detection_list(
     gobs, 
     trans_pose = None,
     class_names = None,
-    BG_CLASSES = ["wall", "floor", "ceiling"],
+    BG_CLASSES=BG_CLASSES,
     color_path = None,
     pipelined_mapping=True,
     dataset_type='replica',
@@ -765,7 +935,8 @@ def build_objects_points_and_colors(image, depth, xu, yv, labels,
                                     obj_color=None,
                                     time_dict=None,
                                     cfg=None,
-                                    masks=None):
+                                    masks=None,
+                                    max_depth_m=None):
     """
     Do frame-wide unprojection, color once, optional jitter once.
     Returns:
@@ -775,6 +946,10 @@ def build_objects_points_and_colors(image, depth, xu, yv, labels,
     t0 = time.perf_counter_ns()
 
     valid = (depth > 0) & (labels >= 0)
+    # Optional far-depth gate. ``max_depth_m`` is the session-level cap stamped
+    # by the client (or pulled from config). None = no cap.
+    if max_depth_m is not None and max_depth_m > 0:
+        valid &= (depth <= max_depth_m)
     if not np.any(valid):
         print("No valid points")
         # if time_dict is not None:
@@ -893,7 +1068,8 @@ def frame_to_object_pcds(depth_array, masks, cam_K, image,
                          add_noise=False, sigma=4e-3,
                          precomputed_xy=None,
                          time_dict=None,
-                         cfg=None):
+                         cfg=None,
+                         max_depth_m=None):
     """
     Returns a dict: obj_id -> open3d PointCloud
     - masks: np.bool_ array of shape (N, H, W) for the *filtered* detections
@@ -921,7 +1097,8 @@ def frame_to_object_pcds(depth_array, masks, cam_K, image,
         obj_color=None,
         time_dict=time_dict,
         cfg=cfg,
-        masks=masks
+        masks=masks,
+        max_depth_m=max_depth_m,
     )
 
     # Wrap in Open3D
@@ -947,19 +1124,20 @@ def frame_to_object_pcds(depth_array, masks, cam_K, image,
 
 
 def gobs_to_detection_list_optimized(
-    cfg, 
-    image, 
+    cfg,
+    image,
     depth_array,
-    cam_K, 
-    idx, 
-    gobs, 
+    cam_K,
+    idx,
+    gobs,
     trans_pose = None,
     class_names = None,
-    BG_CLASSES = ["wall", "floor", "ceiling"],
+    BG_CLASSES=BG_CLASSES,
     color_path = None,
     pipelined_mapping=True,
     dataset_type='replica',
     time_dict=None,
+    max_depth_m=None,
 ):
     global experiment_config
     if experiment_config is None:
@@ -970,6 +1148,23 @@ def gobs_to_detection_list_optimized(
     """
     fg_detection_list = DetectionList()
     bg_detection_list = DetectionList()
+
+    # Defensive: segmentation can occasionally produce a malformed mask —
+    # most often a 2D (H,W) instead of (1,H,W) for a single detection, or
+    # an empty 1D array when xyxy/mask counts disagree. resize_gobs and the
+    # per-mask unproject loop both assume gobs['mask'] is (N,H,W) and crash
+    # deep inside on ``mask.shape[1]`` (IndexError) when it isn't, taking
+    # the whole mapping consumer down. Drop the frame here instead — the
+    # next frame is almost always fine.
+    masks = gobs.get('mask')
+    n_xyxy = len(gobs['xyxy'])
+    if n_xyxy > 0 and (masks is None
+                       or getattr(masks, 'ndim', 0) != 3
+                       or masks.shape[0] != n_xyxy):
+        print(f"[mapping] WARN: dropping frame {idx} — malformed masks "
+              f"(ndim={getattr(masks, 'ndim', None)}, "
+              f"shape={getattr(masks, 'shape', None)}, n_xyxy={n_xyxy})")
+        return fg_detection_list, bg_detection_list, []
 
     pcd_creation_times_ms = []
     pcd_process_times_ms = []
@@ -1016,6 +1211,7 @@ def gobs_to_detection_list_optimized(
         precomputed_xy=None,
         time_dict=time_dict,
         cfg=cfg,
+        max_depth_m=max_depth_m,
     )
     make_pcds_end = time.perf_counter_ns()
     pcd_creation_times_ms.append((make_pcds_end - make_pcds_start)/1e6)

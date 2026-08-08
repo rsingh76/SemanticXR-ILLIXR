@@ -1,0 +1,156 @@
+# Quest debug configuration.
+#
+# Starts from parallelization_mobileclip_objectDownsampling.yaml's performance
+# profile (MobileCLIP-B, batched SAM/CLIP, 2 FPS target, object-based voxel
+# downsampling) and turns on every dump the server can produce so a live Quest
+# stream can be replayed / inspected offline:
+#   * dataset.enabled=true        -> per-frame RGB + depth + meta JSON to
+#                                     ./datasets/quest/dataset_<N>/ in the
+#                                     replay-ready layout (intrinsics.json,
+#                                     decoded_jpg/, depth_*.npy, meta_*.json).
+#                                     Directly consumable by --localDataset.
+#   * debug.dump_inference=true   -> per-frame pkl.gz of detections + masks +
+#                                     CLIP features under
+#                                     <run_output_dir>/debug_dumps/inference/.
+#   * debug.dump_inference_skip_mapping=false -> map STILL builds while dumps
+#                                                are being written.
+#
+# Usage (streaming Quest):
+#   pkill -KILL -f spawn_main    # only if needed (PDEATHSIG usually handles it)
+#   python server/main.py --dataset_type quest \
+#       --config config/debug/quest_debug.yaml --save_map
+# Live-run outputs land under live_output/quest/run_<N>/. The map dumps when
+# the Quest client disconnects or when you hit Ctrl+C (see
+# grpc_server.UploadSyncMessage_quest and signal_handlers.GracefulShutdownHandler).
+#
+# Usage (replay a captured session):
+#   python server/main.py --dataset_type quest --localDataset \
+#       --sceneName dataset_<N> --config config/debug/quest_debug.yaml \
+#       --dataset_stride 1 --save_map
+# Replay outputs land *inside* datasets/quest/dataset_<N>/ (pcd_saves/,
+# debug_dumps/, logs_performance/) so each capture's runs stay co-located.
+
+server:
+  host: "localhost"
+  port: 50051
+  max_workers: 4
+  target_fps: 2.0
+  gpu_id: 0
+
+  inference_queue_size: 2
+  mapping_queue_size: 5
+  visualization_queue_size: 2
+
+video:
+  image_width: 1280
+  image_height: 720
+  depth_width: 256
+  depth_height: 144
+  dataset_depth_width: 1200
+  dataset_depth_height: 680
+  sharpness_threshold: 100.0           # ignored for Quest (H.265, see VideoProcessor)
+  temp_output_dir: "./main_server/temp_output_dir"
+
+dataset:
+  enabled: true                        # <-- Dump incoming frames to disk
+  auto_increment_dirs: true
+  save_images: true
+  save_depth: true
+  save_poses: true
+  results_subdir: "results"
+
+frame_processing:
+  default_client_fps: 2                # Quest streams at ~2 FPS
+  initial_frame_index: -1000
+  frame_skip_logic: "fps_based"
+
+grpc:
+  max_send_message_length: 104857600
+  max_receive_message_length: 104857600
+  keepalive_time_ms: 30000
+  keepalive_timeout_ms: 5000
+  keepalive_permit_without_calls: true
+  max_connection_idle_ms: 60000
+
+logging:
+  enabled: true
+  log_directory: "logs_performance"
+  console_log_interval: 20
+  csv_logging: true
+  json_summary: true
+  keep_recent_frames: 100
+  measure_update_sizes: false          # viz-side telemetry off (expensive); flip for paper logs
+
+model:
+  device: "cuda:0"
+
+  detection:
+    enabled: true
+    device: "cuda:0"
+    detector: "dino"
+    box_threshold: 0.2
+    text_threshold: 0.2
+    nms_threshold: 0.5
+    precision: "float16"
+
+  segmentation:
+    device: "cuda:0"
+    sam_variant: "mobilesam"
+    batched_sam: true
+    trt_sam: false
+
+  clip:
+    device: "cuda:0"
+    model_name: "ViT-H-14"
+    pretrained: "laion2b_s32b_b79k"
+    precision: "fp16"
+    batch_size: 8
+    batched_clip: true
+    trt_clip: false
+
+  captioning:
+    device: "cuda:0"
+    class_set: "ram"
+    tagging_threshold: 0.64
+    add_bg_classes: true
+    accumu_classes: true
+    precision: "float16"
+
+  visualization:
+    device: "cuda:0"
+    similarity_threshold: 0.86
+    min_match_similarity: 0.20       # OrigCLIP floor below which getClipComparison returns empty
+    color_ramp_cap: 0.35             # sim value that saturates the colormap
+    colormap: "RdYlGn_wide"          # custom 7-stop red→green (registered in visualization_service); alternatives: "turbo", "RdYlGn", "Spectral"
+    clip_model: "ViT-H-14"
+    precision: "fp32"
+    batch_size: 1
+    use_trt: false
+    asr:
+      enabled: true
+      # backend: "faster-whisper" (local) | "openai-whisper" (local) | "openai-api" (cloud)
+      backend: "openai-whisper"
+      model: "medium.en"         # tiny.en / base.en / small.en / medium.en / large-v3
+      device: "cuda:0"
+      compute_type: "float16"   # faster-whisper only: float16 / int8_float16 / int8
+      warmup: true
+
+  mapping:
+    device: "cuda:0"
+    mask_conf_threshold: 0.25
+    sim_threshold: 0.5
+    skip_bg: false
+    object_based_downsampling: true
+    test_depth_downsampling: 1
+
+paths:
+  gsa_path: null
+  model_weights_dir: null
+  temp_output_dir: null
+
+debug:
+  dump_inference: true                      # write per-frame pkl.gz of detections/masks/CLIP
+  dump_inference_skip_mapping: false        # keep the map running alongside the dumps
+  current_scene: null                       # auto-detected
+  config_name: "quest_debug"
+  use_slow_vis: true

@@ -40,6 +40,26 @@ mask_area_threshold: 25 # mask with pixel area less than this will be skipped
 mask_conf_threshold: 0.95 # mask with lower confidence score will be skipped
 max_bbox_area_ratio: 0.5 # boxes with larger areas than this will be skipped
 skip_bg: !!bool True
+
+# Ignore list: mask classes dropped entirely from the pipeline before mapping.
+# Separate from BG_CLASSES (wall/floor/ceiling), which are fused as a single
+# per-class background object when skip_bg is false. Filtering happens inside
+# filter_gobs() (slam/core/utils.py) AFTER SAM + CLIP, so humans are still
+# segmented and embedded — they are just never integrated into the map.
+# Dataset-level overrides in e.g. QUEST.yaml are promoted onto the root cfg
+# by process_cfg() in slam/utils/mapping_utils.py.
+skip_ignored: !!bool False
+ignore_classes: []
+
+# CLIP-similarity variant of the ignore filter. When True, mapping_server /
+# inference_pipeline encode `ignore_classes` once via the CLIP text encoder
+# at startup (see init_clip_ignore_filter), then per-frame drop any mask
+# whose CLIP image embedding has cosine similarity > ignore_clip_threshold
+# with any ignored-class text embedding. Robust to upstream tagger
+# vocabulary mismatches (e.g. RAM emits "face" not "human face").
+skip_ignored_clip: !!bool False
+ignore_clip_threshold: 0.28
+debug_ignore_drops: !!bool False
 min_points_threshold: 16 # projected and sampled pcd with less points will be skipped
 
 # point cloud processing
@@ -58,10 +78,19 @@ merge_visual_sim_thresh: 0.8   # Merge only if the visual similarity is larger
 merge_text_sim_thresh: 0.8     # Merge only if the text cosine sim is larger
 
 # Periodically perform post-process operations every k frame
-# -1 means not perform them during the run. They are performed at the end anyway. 
+# -1 means not perform them during the run. They are performed at the end anyway.
 denoise_interval: 1           # Run DBSCAN every k frame. This operation is heavy
 filter_interval: 5            # Filter objects that have too few associations or are too small
 merge_interval: 5             # Merge objects based on geometric and semantic similarity
+
+# Far-depth cap (meters) at unprojection. null = no cap.
+# Resolution chain at session start (server reads ONCE per session, then freezes):
+#   1. Client wire stamp wins (UpstreamSyncMessage_*.max_depth_m). >0 = cap,
+#      <0 = explicit no-cap, 0/unset = "client did not specify", fall through.
+#   2. Per-dataset YAML override (e.g. QUEST.yaml's max_depth_m).
+#   3. This base default.
+# Promoted to root cfg by process_cfg() so consumers read cfg.max_depth_m.
+max_depth_m: null
 
 # Output point cloud
 save_pcd: !!bool True

@@ -29,25 +29,42 @@ class VideoConfig:
     sharpness_threshold: float = 100.0
     temp_output_dir: str = "./main_server/temp_output_dir"
 
-@dataclass  
+@dataclass
 class DatasetConfig:
-    """Dataset saving configuration."""
+    """Dataset saving / replay-source configuration.
+
+    ``output_directory`` is the single root for both:
+      * live capture sinks: ``<output_directory>/<type>/dataset_<N>/`` where
+        type ∈ {quest, ipad}, auto-incremented per type.
+      * replay sources: same path structure; replay reads ``--sceneName`` as a
+        directory name under ``<output_directory>/<type>/``.
+
+    ``live_output_directory`` is the root for live-stream artifacts (semantic
+    map dumps, debug dumps, perf logs) written during a live (gRPC) session,
+    organised as ``<live_output_directory>/<type>/run_<N>/{pcd_saves,
+    debug_dumps, logs_performance}/``. Per-type auto-increment.
+
+    Replay artifacts go *inside* the corresponding ``datasets/<type>/<scene>/``
+    so a single capture directory holds the inputs and every replay run's
+    outputs.
+    """
     enabled: bool = False  # Whether to save dataset files
     output_directory: str = "./datasets"
+    live_output_directory: str = "./live_output"
     auto_increment_dirs: bool = True  # Auto-create dataset_0, dataset_1, etc.
-    
+
     # What to save
     save_images: bool = True
     save_depth: bool = True
     save_poses: bool = True
-    
+
     # Directory structure
     results_subdir: str = "results"
 
 @dataclass
 class FrameProcessingConfig:
     """Frame processing configuration."""
-    default_client_fps: int = 30
+    default_client_fps: int = 2
     initial_frame_index: int = -1000
     frame_skip_logic: str = "fps_based"  # "fps_based" or "interval_based"
 
@@ -61,7 +78,7 @@ class GRPCConfig:
     keepalive_permit_without_calls: bool = True
     max_connection_idle_ms: int = 60000
 
-@dataclass 
+@dataclass
 class LoggingConfig:
     """Performance logging configuration."""
     enabled: bool = True
@@ -70,15 +87,24 @@ class LoggingConfig:
     csv_logging: bool = True
     json_summary: bool = True
     keep_recent_frames: int = 100  # For FPS calculation
+    # When True, viz computes fresh + full-scene proto message sizes every
+    # frame and writes them to update_sizes.csv. This is a pure-telemetry
+    # measurement for paper plots; it's expensive (two full proto builds +
+    # per-object GPU->CPU syncs) and the viz queue drops frames when it runs
+    # on fast configs. Enable only when actually measuring.
+    measure_update_sizes: bool = False
 
 @dataclass
 class DebugConfig:
     """Debug configuration for troubleshooting and development."""
     dump_inference: bool = False  # Enable dumping of inference results (detections, CLIP features)
-    dump_dir: str = "./debug_dumps"  # Directory to save debug dumps
     current_scene: Optional[str] = None  # Scene name for organized dumps (auto-detected if null)
     config_name: Optional[str] = None  # Config name for organized dumps (auto-detected if null)
     use_slow_vis: bool = False  # Enable slow high-quality visualization with captions
+    # When True and dump_inference is also True, the inference worker skips
+    # mapping after writing the pkl (fast capture, no map built). Default is
+    # False so dump + mapping both run in the same session.
+    dump_inference_skip_mapping: bool = False
 
 @dataclass
 class ServerConfig:
@@ -136,15 +162,37 @@ class CaptioningConfig:
     precision: str = "float16"  # Precision for model inference: "float32" or "float16"
 
 @dataclass
+class ASRConfig:
+    """Automatic speech recognition configuration.
+
+    backend:
+      "faster-whisper" — local CTranslate2 Whisper (needs `pip install faster-whisper`)
+      "openai-whisper" — local reference impl    (needs `pip install openai-whisper`)
+      "openai-api"     — OpenAI cloud Whisper    (needs OPENAI_API_KEY + quota)
+
+    model (local backends only): tiny.en / base.en / small.en / medium.en / large-v3
+    """
+    enabled: bool = True               # receive streamed audio and transcribe; False = client sends textQuery
+    backend: str = "faster-whisper"
+    model: str = "small.en"            # local backends only; openai-api always uses whisper-1
+    device: str = "cuda:0"             # local backends only
+    compute_type: str = "float16"      # faster-whisper only: float16 / int8_float16 / int8
+    warmup: bool = True                # run a dummy transcribe at startup to warm the model
+
+@dataclass
 class VisualizationConfig:
     """Visualization configuration."""
     device: str = "cuda:0"  # Device for visualization
     similarity_threshold: float = 0.86
+    min_match_similarity: float = 0.17   # abs-sim floor; below this getClipComparison returns empty
+    color_ramp_cap: float = 0.30         # sim value that saturates the colormap
+    colormap: str = "RdYlGn_wide"        # custom red→orange→yellow→lime→green cmap registered in visualization_service
     clip_model: str = "ViT-H-14"
     pretrained: str = "laion2b_s32b_b79k"
     precision: str = "fp16"
     batch_size: int = 1
     use_trt: bool = False
+    asr: ASRConfig = ASRConfig()
 
 @dataclass
 class MappingConfig:
@@ -289,7 +337,18 @@ class Config:
                 if model_type in model_data:
                     model_config = getattr(config.model, model_type)
                     for key, value in model_data[model_type].items():
-                        if hasattr(model_config, key):
+                        if not hasattr(model_config, key):
+                            continue
+                        # Nested dataclass sections (e.g. visualization.asr) must be merged
+                        # field-by-field, not replaced wholesale — otherwise the YAML dict
+                        # overwrites the dataclass and downstream `cfg.model.visualization.asr.backend`
+                        # access explodes.
+                        current = getattr(model_config, key)
+                        if isinstance(value, dict) and hasattr(current, '__dataclass_fields__'):
+                            for sub_key, sub_value in value.items():
+                                if hasattr(current, sub_key):
+                                    setattr(current, sub_key, sub_value)
+                        else:
                             setattr(model_config, key, value)
                             
         if 'paths' in data:
@@ -349,13 +408,11 @@ class Config:
         # Debug settings
         if os.getenv("DEBUG_DUMP_INFERENCE"):
             config.debug.dump_inference = os.getenv("DEBUG_DUMP_INFERENCE").lower() in ['true', '1', 'yes']
-        if os.getenv("DEBUG_DUMP_DIR"):
-            config.debug.dump_dir = os.getenv("DEBUG_DUMP_DIR")
         if os.getenv("DEBUG_CURRENT_SCENE"):
             config.debug.current_scene = os.getenv("DEBUG_CURRENT_SCENE")
         if os.getenv("DEBUG_CONFIG_NAME"):
             config.debug.config_name = os.getenv("DEBUG_CONFIG_NAME")
-            
+
         return config
 
     @property 
@@ -464,8 +521,6 @@ def _apply_env_overrides(config: Config) -> Config:
     # Debug settings
     if os.getenv("DEBUG_DUMP_INFERENCE"):
         config.debug.dump_inference = os.getenv("DEBUG_DUMP_INFERENCE").lower() in ['true', '1', 'yes']
-    if os.getenv("DEBUG_DUMP_DIR"):
-        config.debug.dump_dir = os.getenv("DEBUG_DUMP_DIR")
     if os.getenv("DEBUG_CURRENT_SCENE"):
         config.debug.current_scene = os.getenv("DEBUG_CURRENT_SCENE")
     if os.getenv("DEBUG_CONFIG_NAME"):

@@ -150,9 +150,9 @@ def compute_clip_features_batched(image, detections, clip_model, clip_preprocess
     text_tokens = []
     clip_model.eval()  # CRITICAL for BatchNorm
     # Prepare data for batch processing
+    image_width, image_height = image.size
     for idx in range(len(detections.xyxy)):
         x_min, y_min, x_max, y_max = detections.xyxy[idx]
-        image_width, image_height = image.size
         left_padding = min(padding, x_min)
         top_padding = min(padding, y_min)
         right_padding = min(padding, image_width - x_max)
@@ -162,6 +162,16 @@ def compute_clip_features_batched(image, detections, clip_model, clip_preprocess
         y_min -= top_padding
         x_max += right_padding
         y_max += bottom_padding
+
+        # Defense in depth — should be unreachable given upstream clamping
+        # in detection.py and the race-free results snapshot in
+        # inference_pipeline.py. Log+skip if we ever land here so the crash
+        # surfaces as a warning instead of taking the worker down.
+        if x_max <= x_min or y_max <= y_min:
+            print(f"[CLIP] WARN: degenerate box idx={idx} "
+                  f"x=({x_min:.1f},{x_max:.1f}) y=({y_min:.1f},{y_max:.1f}) "
+                  f"image={image_width}x{image_height} — skipping")
+            continue
 
         cropped_image = image.crop((x_min, y_min, x_max, y_max))
         preprocessed_image = clip_preprocess(cropped_image).unsqueeze(0)

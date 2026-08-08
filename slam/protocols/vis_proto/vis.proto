@@ -20,6 +20,7 @@ message allPointClouds {
     repeated float colors = 2;
     int32 numPointClouds = 3;
     float serverQueryProcessing = 4;
+    string textQuery = 5;
 }
 
 message Objects {
@@ -47,6 +48,12 @@ message Status {
 message AudioFile{
     bytes chunk_data = 1;
     string textQuery = 2;
+    // Per-query overrides for the visualization match thresholds. When unset,
+    // the server falls back to model.visualization.{similarity_threshold,
+    // min_match_similarity} from its YAML config. `optional` (proto3) makes
+    // "unset" distinguishable from a literal 0.0.
+    optional float similarity_threshold = 3;
+    optional float min_match_similarity = 4;
 }
 
 service VisualizerServer {

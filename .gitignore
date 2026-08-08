@@ -27,7 +27,7 @@ semantic_slam_server.egg-info/
 
 # Runtime artifacts (don't track generated data)
 logs_performance/
-datasets/
+/datasets/
 debug_dumps/
 server/debug_dumps/
 

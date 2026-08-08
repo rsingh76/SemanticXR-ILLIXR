@@ -41,9 +41,10 @@ from slam.utils.ious import compute_2d_box_contained_batch
 from slam.utils.general_utils import to_tensor, to_numpy
 from slam.core.slam_classes import MapObjectList, DetectionList
 from slam.core.utils import (
-    merge_obj2_into_obj1, 
+    filter_detections_clip_ignore,
+    merge_obj2_into_obj1,
     filter_objects,
-    merge_objects, 
+    merge_objects,
     denoise_selected_objects,
 )
 from slam.core.mapping import (
@@ -54,13 +55,16 @@ from slam.core.mapping import (
 )
 
 from slam.utils.mapping_utils import (
+    BG_CLASSES,
     get_dataset,
     create_pcd_parallel,
+    init_clip_ignore_filter,
+    resolve_session_max_depth,
     setup,
 )
 from slam.utils.debug_utils import dump_semantic_map, dump_inference_results
+from slam.utils.performance_manager import get_performance_manager
 
-BG_CLASSES = ["wall", "floor", "ceiling"]
 ASYNC_IO=True
 
 DEBUG_PRINT = True
@@ -69,8 +73,83 @@ def debug_print(*args, **kwargs):
         print(*args, **kwargs)
 
 
+def _forward_signal_nonblocking(queue, item, name, total_timeout=30.0):
+    """Forward a control signal to the viz queue without blocking forever.
 
-def inference_consumer(inferenceQueue, 
+    The viz consumer can fall behind (or wedge) in pipelined configs; blocking
+    on a full queue here deadlocks the shutdown path. We poll up to total_timeout
+    seconds and log on failure so the inference process can always proceed.
+    """
+    import queue as _queue
+    deadline = time.time() + total_timeout
+    while time.time() < deadline:
+        try:
+            queue.put(item, timeout=0.5)
+            return True
+        except _queue.Full:
+            continue
+    print(f"⚠️  [INFERENCE] Could not forward {name} signal to viz within {total_timeout:.0f}s; continuing anyway")
+    return False
+
+
+def _wake_viz_consumer(address='localhost:50054', connect_timeout=120.0):
+    """Ensure the viz server is reachable, then fire its ``updateMap`` drain loop.
+
+    This function BLOCKS the caller until either viz is reachable or
+    ``connect_timeout`` elapses. Viz's gRPC server boots slowly (loads CLIP
+    weights), and viz's drain loop only starts after someone calls
+    ``updateMap``. If inference starts producing frames before the drain loop
+    is running, the viz queue fills up and every frame is dropped — a race the
+    user has seen repeatedly. Blocking here closes that window.
+
+    Once viz is reachable, the actual RPC is fired on a daemon thread because
+    viz's ``updateMap`` handler is a ``while True: queue.get()`` loop that
+    never returns.
+    """
+    channel = grpc.insecure_channel(address)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=connect_timeout)
+    except grpc.FutureTimeoutError:
+        print(f"⚠️  [INFERENCE] Viz server at {address} not reachable within "
+              f"{connect_timeout:.0f}s; drain loop won't start. Frames will be dropped.")
+        return None
+
+    stub = vis_pb2_grpc.VisualizerServerStub(channel)
+
+    def _runner():
+        try:
+            # Blocks forever — viz's updateMap never returns. That's fine; we
+            # just need the server to enter its drain loop.
+            stub.updateMap(vis_pb2.Status(message=True))
+        except grpc.RpcError as e:
+            # Expected on shutdown when viz cancels the RPC; don't be noisy.
+            debug_print(f"[INFERENCE] viz wake RPC closed: {e.code() if hasattr(e, 'code') else e}")
+
+    t = threading.Thread(target=_runner, name="viz-wakeup", daemon=True)
+    t.start()
+    print(f"✅ [INFERENCE] Viz server reachable at {address}; drain loop started.")
+    return t
+
+
+
+def _set_pdeathsig_on_linux():
+    """Die automatically if the parent server dies (Linux PR_SET_PDEATHSIG).
+
+    Without this, SIGKILL to the main server leaves this multiprocessing
+    child as an orphan holding its grpc channel + queues, which breaks the
+    next run. Silent no-op on non-Linux platforms.
+    """
+    import ctypes
+    import signal as _signal
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, _signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        pass
+
+
+def inference_consumer(inferenceQueue,
                        visualizationQueue,
                        useDetector=False,
                        config=None,
@@ -79,6 +158,7 @@ def inference_consumer(inferenceQueue,
                        save_map=False,
                        scene_name=None,
                        ):
+    _set_pdeathsig_on_linux()
     # Extract config values or use defaults if config is None
     if config is None:
         print("WARNING: No config provided, using default config")
@@ -132,6 +212,7 @@ def inference_consumer(inferenceQueue,
     # ######################################################### MAPPING SERVER ############################################################################################################
     
     cfg = setup(useDetector, datasetClass)
+    init_clip_ignore_filter(cfg, config)
     dataset = get_dataset(
         datasetClass=datasetClass,
         config_dict = cfg.dataset_config,
@@ -157,20 +238,23 @@ def inference_consumer(inferenceQueue,
     objects = MapObjectList(device=config.model.device)
     
     
-    if ASYNC_IO:
-        made_grpc_call = False
-        # For sending the results to mapping server
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        channel = grpc.aio.insecure_channel('localhost:50054')
-    else:
-        channel = grpc.insecure_channel('localhost:50054')
-    
-    
-    # Create a gRPC channel and stub
-    # channel = grpc.insecure_channel('localhost:50054') 
-    stub = vis_pb2_grpc.VisualizerServerStub(channel)
+    # Wake the viz consumer once on a daemon thread. Viz's updateMap handler
+    # doesn't return (it's a forever drain loop), so awaiting it would deadlock
+    # the inference loop. Running it as fire-and-forget also avoids a race where
+    # a fast producer drops every frame before viz is ever called.
+    _wake_viz_consumer()
+
     skipped_frames = 0
+    # Frame-timing logs live in this process so they capture every processed
+    # frame, not just those that make it past the viz queue's backpressure drop.
+    perf_mgr = get_performance_manager(scene_name=scene_name)
+
+    # Session-scoped freeze for the client-stamped depth cap. The FIRST frame
+    # of each session locks the value; later per-frame stamps are silently
+    # ignored — the cap is a session-level knob, not a per-frame control.
+    # Sentinel ``object()`` ≠ any ``Optional[float]``.
+    _UNSET_CAP = object()
+    session_max_depth_m = _UNSET_CAP
     print("*****************************************************[Mapping Consumer Started]*****************************************************")
     print("Configuration:")
     print(f"[MAPPING SERVER] useDetector: {useDetector}")
@@ -180,6 +264,7 @@ def inference_consumer(inferenceQueue,
     print(f"[MAPPING SERVER] skip_bg: {cfg.skip_bg}")
     print(f"[MAPPING SERVER] mask_conf_threshold: {cfg.mask_conf_threshold}")
     print(f"[MAPPING SERVER] test_depth_downsampling: {test_depth_downsampling}")
+    print(f"[MAPPING SERVER] voxel size: {cfg.dataset_config.downsample_voxel_size}")
     
     while True:
         # dequeue a frame 
@@ -193,7 +278,7 @@ def inference_consumer(inferenceQueue,
             scene_name = queue_item['scene_name']
             print(f"🎯 [INFERENCE] Received scene completion signal for {scene_name}")
             print(f"🧹 [INFERENCE] Saving map data for {scene_name} (has {len(objects)} objects)")
-            
+
             # Dump semantic map BEFORE clearing anything
             scene_classes = ['item']  # Default for non-detector mode
             if useDetector and captioning_model.global_classes:
@@ -201,7 +286,18 @@ def inference_consumer(inferenceQueue,
             elif useDetector and hasattr(captioning_model, 'classes') and captioning_model.classes:
                 scene_classes = captioning_model.classes
             dump_semantic_map(scene_name, objects, bg_objects, cfg, scene_classes, save_map, test_depth_downsampling=test_depth_downsampling)
-            
+
+            # Flush per-scene performance summary + frame_timing accumulator.
+            perf_mgr.write_scene_summary_and_reset(scene_name)
+
+            # Switch to the next session's run_dir BEFORE clearing in-memory
+            # state, so any further log writes here land in run_<N+1>/.
+            new_run_dir = queue_item.get('run_output_dir')
+            if new_run_dir:
+                os.environ['SLAM_RUN_OUTPUT_DIR'] = new_run_dir
+                perf_mgr.rebind_run_dir(new_run_dir)
+                print(f"🔄 [INFERENCE] Run dir → {new_run_dir}")
+
             # Now clear accumulated map data for next scene
             objects.clear()
             if not cfg.skip_bg:
@@ -211,24 +307,43 @@ def inference_consumer(inferenceQueue,
             history_map = {}
             next_index = 0
             idx = 0
-            
+            # Force re-log of the depth cap on the first frame of the new
+            # session — the next client may stamp a different value.
+            last_logged_max_depth = _UNSET_CAP
+
             # Clear accumulated classes from captioning model for next scene
             if useDetector:
                 captioning_model.global_classes.clear()
                 captioning_model.classes = None
                 print(f"🧹 [INFERENCE] Cleared all data for next scene")
-            
-            # Forward completion signal to visualization queue
-            visualizationQueue.put(queue_item)
+
+            # Forward completion signal to visualization queue (non-blocking: if
+            # viz is wedged we still want the inference process to continue).
+            _forward_signal_nonblocking(visualizationQueue, queue_item, "scene_completion")
             continue
-            
+
         # Check if this is a shutdown signal
         if isinstance(queue_item, dict) and queue_item.get('type') == 'shutdown':
             print("🏁 [INFERENCE] Received shutdown signal. Exiting...")
-            visualizationQueue.put(queue_item)  # Forward to visualization
+            perf_mgr.cleanup()
+            _forward_signal_nonblocking(visualizationQueue, queue_item, "shutdown")
             break
             
-        image_pil, image_cv2_bgr, depth_array, pose_array, frameNumber, starting_timestamp, clientTimeStamps, time_dict = queue_item
+        # 9-slot tuple: slot 9 is the per-frame client wire stamp
+        # (Optional[float]; None = "client didn't specify"). See
+        # server/components/inference_service.py::submit_inference_request.
+        image_pil, image_cv2_bgr, depth_array, pose_array, frameNumber, starting_timestamp, clientTimeStamps, time_dict, client_max_depth_m = queue_item
+
+        # Read once per session, freeze, then ignore later per-frame stamps.
+        # ``session_max_depth_m`` is reset on the scene_completion handler
+        # above, so a fresh client gets a fresh resolution.
+        if session_max_depth_m is _UNSET_CAP:
+            session_max_depth_m = resolve_session_max_depth(client_max_depth_m, cfg)
+            if session_max_depth_m is None:
+                print(f"[INFERENCE]\t\t Mapping depth cap (session): NONE (no cap)")
+            else:
+                print(f"[INFERENCE]\t\t Mapping depth cap (session): {session_max_depth_m:.3f} m")
+        max_depth_m = session_max_depth_m
         # print("[MAPPING SERvER]\t\t\t Time taken so far (Decoding + Queue time): ", (time.perf_counter_ns() - starting_timestamp)/1e6)
         # convert the frame to a numpy array
         # pass the numpy array to the model
@@ -267,12 +382,15 @@ def inference_consumer(inferenceQueue,
             seg_end = time.perf_counter_ns()
             time_dict['segmentation_time'] = (seg_end - start_time)/1e6
                             
-        # Convert the detections to a dict. The elements are in np.array
+        # Convert the detections to a dict. The elements are in np.array.
+        # Copy arrays so the child create_pcd_parallel thread (which rescales
+        # gobs['xyxy'] in place in core/utils.py when mask.shape != image.shape)
+        # does not mutate `detections` concurrently with the CLIP crop loop.
         results = {
-            "xyxy": detections.xyxy,
-            "confidence": detections.confidence,
-            "class_id": detections.class_id,
-            "mask": detections.mask,
+            "xyxy": detections.xyxy.copy(),
+            "confidence": detections.confidence.copy(),
+            "class_id": detections.class_id.copy(),
+            "mask": detections.mask.copy() if detections.mask is not None else None,
             "classes":  classes,
             # "image_crops": None,
             "image_feats": None,
@@ -285,7 +403,7 @@ def inference_consumer(inferenceQueue,
             
         image_np =  np.array(image_pil)
         output_receiver_list = [] 
-        child_thread = threading.Thread(target=create_pcd_parallel, args=(image_np, depth_array, pose_array, frameNumber, dataset, cfg, classes, results, output_receiver_list, pipelined_mapping ,datasetClass, time_dict))
+        child_thread = threading.Thread(target=create_pcd_parallel, args=(image_np, depth_array, pose_array, frameNumber, dataset, cfg, classes, results, output_receiver_list, pipelined_mapping ,datasetClass, time_dict, max_depth_m))
         child_thread.start()
         
         
@@ -298,9 +416,14 @@ def inference_consumer(inferenceQueue,
 
         child_thread.join()
         time_dict['inference_time'] = time_dict['clip_time'] + time_dict['segmentation_time'] + time_dict['detection_time'] + time_dict['caption_time']
+        # Dump-only mode: if config.debug.dump_inference_skip_mapping is set,
+        # write the pkl and short-circuit the rest of the pipeline (fast
+        # capture of inference outputs, no map built). Default is to dump AND
+        # keep mapping so both artifacts exist in the same run.
         if config.debug.dump_inference:
             dump_inference_results(results, frameNumber, image_pil, depth_array, pose_array, classes, config)
-            continue                  # to avoid running the whole thing, and focus only on the inference part
+            if getattr(config.debug, 'dump_inference_skip_mapping', False):
+                continue
             
         
         
@@ -321,7 +444,17 @@ def inference_consumer(inferenceQueue,
             obj['clip_ft'] = to_tensor(image_feats[obj['mask_idx'][0]])
             obj['text_ft'] = to_tensor(text_feats[obj['mask_idx'][0]])
             # obj['image_crops'] = image_crops[obj['mask_idx'][0]]
-            
+
+        # CLIP-similarity ignore filter (non-pipelined path). filter_gobs()
+        # ran in parallel with CLIP in the child thread above, so it saw
+        # gobs['image_feats']=None and skipped its own CLIP block. Apply the
+        # drop here, now that clip_ft is attached to each detection, before
+        # anything enters the map. Implementation lives next to filter_gobs
+        # in slam/core/utils.py.
+        fg_detection_list, bg_detection_list = filter_detections_clip_ignore(
+            cfg, fg_detection_list, bg_detection_list
+        )
+
         if len(bg_detection_list) > 0:
             for detected_object in bg_detection_list:
                 class_name = detected_object['class_name'][0]
@@ -388,10 +521,17 @@ def inference_consumer(inferenceQueue,
             denoise_end = time.perf_counter_ns()
             time_dict['post_process_denoise_time'] = (denoise_end - denoise_start)/1e6
         if cfg.filter_interval > 0 and (idx+1) % cfg.filter_interval == 0:
+            filter_start = time.perf_counter_ns()
             objects,removed_obj_1, history_map = filter_objects(cfg, objects, history_map)
+            time_dict['filter_objects_time'] = (time.perf_counter_ns() - filter_start)/1e6
         if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
+            merge_objs_start = time.perf_counter_ns()
             objects, removed_object_2, edited_objects_idx_2, history_map = merge_objects(cfg, objects, history_map)
-        
+            # This is the O(N^2) pairwise FAISS overlap step — the main
+            # super-linear term as the map grows.
+            time_dict['merge_objects_time'] = (time.perf_counter_ns() - merge_objs_start)/1e6
+        time_dict['num_objects'] = len(objects)
+
         idx += 1
         
         final_removed_objects = removed_obj_1 + removed_object_2
@@ -423,46 +563,27 @@ def inference_consumer(inferenceQueue,
         }
         
         
-        result_serialization_time = time.perf_counter_ns()      
-        
+        result_serialization_time = time.perf_counter_ns()
+        time_dict['post_processing_time'] = (pre_serial_time - mergin_end)/1e6
+        time_dict['mapping_time'] += (result_serialization_time - map_start_time)/1e6
+        time_dict['clip_mapping'] = (result_serialization_time - seg_end)/1e6
+        time_dict['total_time']     = (result_serialization_time - start_time)/1e6
+
+        # Log timing here — not in the viz consumer — so we capture every
+        # processed frame regardless of whether the viz queue has room.
+        perf_mgr.log_frame_timing(
+            frame_number=frameNumber,
+            timing_dict=time_dict,
+            server_timestamp=time.perf_counter_ns(),
+            client_timestamp=clientTimeStamps,
+        )
+
         if visualizationQueue.full():
             skipped_frames += 1
             print(f"⚠️  [MAPPING→VISUALIZATION] Queue full! Dropping frame {frameNumber}. Total skipped: {skipped_frames}")
             print(f"    Frame details: {len(fg_detection_list)} objects detected, {len(objects)} total objects")
-            continue  
-        time_dict['post_processing_time'] = (pre_serial_time - mergin_end)/1e6   
-        time_dict['mapping_time'] += (result_serialization_time - map_start_time)/1e6   
-        time_dict['clip_mapping'] = (result_serialization_time - seg_end)/1e6
-        time_dict['total_time']     = (result_serialization_time - start_time)/1e6
+            continue
         visualizationQueue.put((results,  frameNumber, starting_timestamp, clientTimeStamps, time_dict))
-        
-        
-        async def makeGRPCCall():   
-            # Create the request message
-            vis_request = vis_pb2.Status(message=True)
-
-            # Send the request to the visualization server
-            try:
-                response = stub.updateMap(vis_request)
-                # print(f"Visualization server response: {response.message}")
-            except grpc.RpcError as e:
-                print(f"gRPC error: {e}")
-        
-        if ASYNC_IO:
-            if not made_grpc_call:
-                loop.run_until_complete(makeGRPCCall())
-                made_grpc_call = True
-        else:
-            
-            # Create the request message
-            vis_request = vis_pb2.Status(message=True)
-
-            # Send the request to the visualization server
-            try:
-                response = stub.updateMap(vis_request)
-                debug_print(f"Visualization server response: {response.message}")
-            except grpc.RpcError as e:
-                debug_print(f"gRPC error: {e}")
         grpcs_time = time.perf_counter_ns()
         
         # debug_print(f"[MAPPING SERvER] Frame {idx}: Detected {len(fg_detection_list)} objects. Total objects: {len(objects)}, Time taken for computation: {(end_compute - start_time)/1e6} ms, Serialization: {(result_serialization_time - end_compute)/1e6} ms, gRPC: {(grpcs_time - result_serialization_time)/1e6} ms")

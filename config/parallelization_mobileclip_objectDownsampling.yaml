@@ -128,7 +128,6 @@ paths:
 debug:
   # Inference results dumping for reproducibility debugging
   dump_inference: false           # Enable dumping of inference results (detections, CLIP features)
-  dump_dir: "./debug_dumps"       # Directory to save debug dumps
   current_scene: null             # Scene name for organized dumps (auto-detected if null)
   config_name: null               # Config name for organized dumps (auto-detected if null)
   use_slow_vis: true              # Enable slow high-quality visualization with captions

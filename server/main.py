@@ -136,9 +136,14 @@ class XRService(xr_service_pb2_grpc.XrServiceServicer):
         """Handle regular upload requests - delegates to component architecture."""
         return self.slam_server.UploadSyncMessage(request_iterator, context)
 
+    def UploadSyncMessage_quest(self, request_iterator, context):
+        """Handle Quest upload requests - delegates to component architecture."""
+        return self.slam_server.UploadSyncMessage_quest(request_iterator, context)
+
 
 
 def serve(inferenceQueue, target_fps, config=None):
+    _set_pdeathsig_on_linux()
     from config.settings import get_config
     if config is None:
         config = get_config()
@@ -169,7 +174,7 @@ def get_parser():
     parser = argparse.ArgumentParser(description='XR Scene Builder Server')
     
     # Essential runtime parameters (cannot be in config files)
-    parser.add_argument('--dataset_type', type=str, choices=['ipad', 'replica', 'scannet'], required=True, 
+    parser.add_argument('--dataset_type', type=str, choices=['ipad', 'replica', 'scannet', 'quest'], required=True,
                        help='Dataset type - determines operational mode')
     parser.add_argument('--config', type=str, default=None, 
                        help='Path to YAML configuration file (e.g., config/production.yaml, config/development.yaml). If not specified, uses config/defaults.yaml')
@@ -214,8 +219,25 @@ def apply_config_overrides(config, args):
     return config
 
 
+def _set_pdeathsig_on_linux():
+    """Die automatically if the parent server dies (Linux PR_SET_PDEATHSIG).
+
+    Without this, a SIGKILL of the top-level server process leaves
+    multiprocessing children running as orphans. Silent no-op elsewhere.
+    """
+    import ctypes
+    import signal as _signal
+    try:
+        PR_SET_PDEATHSIG = 1
+        libc = ctypes.CDLL('libc.so.6', use_errno=True)
+        libc.prctl(PR_SET_PDEATHSIG, _signal.SIGTERM, 0, 0, 0)
+    except Exception:
+        pass
+
+
 def useDataset(inferenceQueue, args, dataset_Name = None):
     """Modular dataset processing function that supports multiple dataset types."""
+    _set_pdeathsig_on_linux()
     import os
     import signal
     import glob
@@ -255,8 +277,9 @@ def useDataset(inferenceQueue, args, dataset_Name = None):
                 _process_replica_dataset(inferenceQueue, args, config, datasetName, paths)
             elif dataset_type == 'scannet':
                 _process_scannet_dataset(inferenceQueue, args, config, datasetName, paths)
+            elif dataset_type == 'quest':
+                _process_quest_dataset(inferenceQueue, args, config, datasetName, paths)
             else:
-                # This should never be reached due to validation above, but just in case
                 raise ValueError(f"Unsupported dataset type for local processing: {dataset_type}")
                 
         except Exception as e:
@@ -349,6 +372,93 @@ def _process_scannet_dataset(inferenceQueue, args, config, datasetName, paths):
     _send_completion_signal(inferenceQueue, datasetName, num_frames)
 
 
+def _process_quest_dataset(inferenceQueue, args, config, datasetName, paths):
+    """Process Quest dataset from local files (replay of a captured live session).
+
+    Scene layout produced by ``SLAMGRPCServer._save_quest_replay_frame`` and
+    consumed here:
+        intrinsics.json                  - scene-level RGB+depth intrinsics + sizes
+        decoded_jpg/frame_NNNNNN.jpg     - RGB at NATIVE resolution
+        depth_NNNNNN.npy                 - float32 metric depth, NATIVE depth resolution
+        meta_NNNNNN.json                 - per-frame poses (as received) + timestamps
+
+    Quest RGB and depth are independent sensors with different poses and
+    intrinsics, so we:
+      * downsample RGB to the pipeline's processing resolution (QUEST.yaml);
+      * resample the native depth into the RGB camera frame by unprojecting
+        with depth_pose/depth_intrinsics and reprojecting with
+        rgb_camera_pose/rgb_intrinsics (``build_depth_in_rgb_frame``);
+      * feed rgb_camera_pose to the pipeline so intrinsics and pose describe
+        the same (RGB) camera.
+    """
+    import glob
+    import re
+    from natsort import natsorted
+    from slam.datasets.quest import load_quest_meta, build_depth_in_rgb_frame
+
+    meta_files = natsorted(glob.glob(os.path.join(paths['meta_path'], 'meta_*.json')))
+    if not meta_files:
+        print(f"⚠️ No meta files found in {paths['meta_path']}. Skipping.")
+        return
+
+    # Discover valid frames (must have RGB + depth + meta)
+    frames = []
+    for meta_path in meta_files:
+        frame_num = int(re.search(r'meta_(\d+)', meta_path).group(1))
+        rgb_path = os.path.join(paths['image_path'], f'frame_{frame_num:06d}.jpg')
+        depth_path = os.path.join(paths['depth_path'], f'depth_{frame_num:06d}.npy')
+        if os.path.exists(rgb_path) and os.path.exists(depth_path):
+            frames.append((frame_num, rgb_path, depth_path, meta_path))
+
+    if not frames:
+        print(f"⚠️ No complete frames (RGB+depth+meta) in {datasetName}. Skipping.")
+        return
+
+    # Processing resolution comes from QUEST.yaml (camera_params.image_width/height).
+    # Load once so every frame is resampled identically.
+    from slam.utils.mapping_utils import setup as _slam_setup
+    slam_cfg = _slam_setup(useDetector=True, datasetClass='quest')
+    target_w = int(slam_cfg.image_width)
+    target_h = int(slam_cfg.image_height)
+
+    # Apply stride
+    frames = frames[::args.dataset_stride]
+    num_frames = len(frames)
+    print(f"🥽 Quest: {num_frames} frames to process (stride={args.dataset_stride}), "
+          f"resampling to {target_w}x{target_h} in RGB camera frame")
+
+    for i, (frame_num, rgb_path, depth_path, meta_path) in enumerate(
+            tqdm(frames, desc=f"Processing {datasetName}")):
+        meta = load_quest_meta(meta_path)
+
+        # Skip frames with degenerate poses (Quest sometimes emits zero rotations).
+        rgb_pose = meta['rgb_camera_pose']
+        d_pose = meta['depth_pose']
+        if (abs(np.linalg.det(rgb_pose[:3, :3])) < 0.5
+                or abs(np.linalg.det(d_pose[:3, :3])) < 0.5):
+            continue
+
+        imagePIL = Image.open(rgb_path).convert('RGB').resize(
+            (target_w, target_h), Image.LANCZOS)
+        depth_native = np.load(depth_path).astype(np.float32)
+
+        # Depth resampled into the RGB camera frame at the processing resolution.
+        depthArray = build_depth_in_rgb_frame(meta, depth_native, target_h, target_w)
+
+        # Pipeline's load_poses applies the OpenGL->OpenCV Y/Z flip to whatever
+        # we pass in; the right c2w is the RGB camera's pose.
+        pose = [i] + rgb_pose.flatten().tolist()
+
+        clientFrameNumber = i
+        clientTimeStamps = time.perf_counter_ns()
+
+        inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose,
+                            clientFrameNumber, clientTimeStamps, clientTimeStamps, {}))
+        time.sleep(1 / config.server.target_fps)
+
+    _send_completion_signal(inferenceQueue, datasetName, num_frames)
+
+
 def _send_completion_signal(inferenceQueue, datasetName, num_frames):
     """Send completion signal for a processed dataset."""
     print(f"⏳ Scene {datasetName}: {num_frames} frames enqueued. Waiting for queue to drain...")
@@ -415,7 +525,32 @@ if __name__ == '__main__':
     # Set environment variables so all child processes use the same names
     os.environ['SLAM_CONFIG_NAME'] = config_name
     os.environ['SLAM_SCENE_NAME'] = scene_name
-    print(f"🎯 Performance logging: logs_performance/{config_name}/{scene_name}/")
+    os.environ['SLAM_DATASET_TYPE'] = args.dataset_type.lower()
+
+    # Single run-output root that pcd_saves, debug_dumps, and logs_performance
+    # all hang off of. Exposed via SLAM_RUN_OUTPUT_DIR so child processes /
+    # workers don't need to reconstruct the layout themselves.
+    #   replay (--localDataset):
+    #       quest               -> <dataset.output_directory>/quest/<scene_name>/
+    #       replica / scannet   -> ./output/<type>/<scene_name>/   (external read-only datasets)
+    #   live (gRPC):
+    #       <dataset.live_output_directory>/<type>/run_<N>/        (per-type auto-increment)
+    dataset_type_l = args.dataset_type.lower()
+    if args.localDataset:
+        if dataset_type_l == 'quest':
+            run_output_dir = Path(config.dataset.output_directory) / 'quest' / scene_name
+        else:
+            run_output_dir = Path('./output') / dataset_type_l / scene_name
+    else:
+        live_root = Path(config.dataset.live_output_directory) / dataset_type_l
+        live_root.mkdir(parents=True, exist_ok=True)
+        existing = [d.name for d in live_root.iterdir() if d.is_dir() and d.name.startswith('run_')]
+        next_n = (max((int(d.split('_', 1)[1]) for d in existing if d.split('_', 1)[1].isdigit()), default=-1) + 1)
+        run_output_dir = live_root / f'run_{next_n}'
+    run_output_dir.mkdir(parents=True, exist_ok=True)
+    os.environ['SLAM_RUN_OUTPUT_DIR'] = str(run_output_dir.resolve())
+    print(f"🎯 Run output dir: {run_output_dir}")
+    print(f"🎯 Performance logging: {run_output_dir}/logs_performance/{config_name}/")
     
     shutdown_handler = install_signal_handlers()
     
@@ -435,12 +570,12 @@ if __name__ == '__main__':
 
     # Create producer thread based on dataset type and mode
     if args.localDataset:
-        # Local dataset processing (Replica, ScanNet)
+        # Local dataset processing (Replica, ScanNet, Quest)
         if args.dataset_type == "ipad":
-            raise ValueError("iPad is a real-time streaming dataset, not a local dataset. Remove --localDataset flag for iPad.")
-        
-        if args.dataset_type not in ["replica", "scannet"]:
-            raise ValueError(f"Local dataset processing only supports 'replica' and 'scannet', got '{args.dataset_type}'")
+            raise ValueError("iPad is a real-time streaming dataset, not a local dataset. Remove --localDataset flag.")
+
+        if args.dataset_type not in ["replica", "scannet", "quest"]:
+            raise ValueError(f"Local dataset processing only supports 'replica', 'scannet', and 'quest', got '{args.dataset_type}'")
         
         if args.sceneName:
             print(f"🗂️ Processing local {args.dataset_type} dataset, scene: {args.sceneName}")
@@ -449,9 +584,11 @@ if __name__ == '__main__':
             
         producer_thread = multiprocessing.Process(target=useDataset, args=(inferenceQueue, args, args.sceneName))
     else:
-        # Real-time streaming mode (iPad, or gRPC server for Replica/ScanNet)
+        # Real-time streaming mode (iPad, Quest, or gRPC server for Replica/ScanNet)
         if args.dataset_type == "ipad":
             print("📱 Starting iPad real-time streaming mode")
+        elif args.dataset_type == "quest":
+            print("🥽 Starting Quest real-time streaming mode")
         else:
             print(f"🌐 Starting gRPC server for {args.dataset_type} dataset")
             
@@ -496,6 +633,10 @@ if __name__ == '__main__':
     if args.pipelined_mapping:
         processes.append(mapping_consumer_thread)
     shutdown_handler.register_processes(processes)
+    # For streaming runs there's no _send_completion_signal caller — the
+    # shutdown handler needs a handle to the inference queue so Ctrl+C can
+    # push scene_completion and dump_semantic_map actually fires.
+    shutdown_handler.register_inference_queue(inferenceQueue, scene_name=scene_name)
     
     # Start the threads
     producer_thread.start()

@@ -1,0 +1,111 @@
+dataset_name: 'quest'
+
+# CLIP-similarity ignore filter (preferred). When True, the mapping consumer
+# encodes ignore_classes via the CLIP text encoder once at startup, then
+# drops any mask whose CLIP image embedding cosine-sim > threshold with any
+# ignored-class text embedding. Independent of the string-match path below
+# (skip_ignored is auto-enabled by process_cfg whenever ignore_classes is
+# non-empty). CLIP-similarity is robust to RAM's vocabulary, so "human face"
+# below activates on actual human faces even though RAM tags as "face".
+skip_ignored_clip: !!bool False
+ignore_clip_threshold: 0.24      # tunable; log per-drop sims via debug_ignore_drops
+debug_ignore_drops: !!bool True  # flip True for first few sessions to dial in threshold
+downsample_voxel_size: 0.02
+# Ignore-list for SemanticXR on Quest: any mask whose class name matches one
+# of these is dropped before mapping (see filter_gobs in slam/core/utils.py).
+# Promoted onto the root cfg by process_cfg() in slam/utils/mapping_utils.py,
+# which flips cfg.skip_ignored to True when this list is non-empty.
+ignore_classes:
+  - a photo of a person
+  - a photo of a people
+  - a photo of a human
+  - a photo of a man
+  - a photo of a woman
+  - a photo of a boy
+  - a photo of a girl
+  - a photo of a child
+  - a photo of a human face
+  - a photo of a human body
+  - a photo of a human hand
+  - a photo of a human head
+  - a photo of a human leg
+  # - a photo of a human arm
+  # - a photo of a human foot
+  # - a photo of a human body
+  # - a photo of a human torso
+  # - a photo of a human shoulder
+
+mapping:
+  every_frame: 5
+  sim_threshold: 0.90
+  # voxel_size multiplier used while downsampling objects whose point clouds
+  # exceed ~2000 points. Lives here (not in code) so it can be tuned per
+  # dataset without touching slam/core/utils.py.
+  object_based_downsampling: 1.1
+
+# Far-depth cap (meters) used at unprojection — Quest IR depth gets noisy past
+# ~3-4m, so this is the most useful debug knob for "stop pulling in walls
+# behind the room". null = no cap. The headset can override this per session
+# via UpstreamSyncMessage_quest.max_depth_m (>0 = cap, <0 = explicit no-cap,
+# 0/unset = use this YAML value). See base.yaml for the full resolution chain.
+max_depth_m: 7.0
+
+# Post-process cadence + merge thresholds (override base.yaml per-dataset).
+# Promoted onto the root cfg by process_cfg() in slam/utils/mapping_utils.py
+# so the per-frame mapping loop reads them as cfg.<key>. -1 disables the pass.
+denoise_interval: 1
+filter_interval: 5
+merge_interval: -1             # periodic global overlap dedup (-1 means disabled)
+merge_overlap_thresh: 0.7
+merge_visual_sim_thresh: 0.8
+merge_text_sim_thresh: 0.8
+
+# IMPORTANT: camera_params.image_width/height below is the PROCESSING TARGET,
+# NOT the Quest sensor's native image dimensions. The Quest RGB sensor emits
+# 1280x1280 and the environment-depth sensor emits 320x320; we always resample
+# BOTH into a single RGB-camera frame at this target resolution before feeding
+# detection / SAM / mapping.
+#
+# The field is named camera_params.image_width/height because BaseDataset
+# expects that key as the input-to-be-downsampled resolution. For Quest the
+# "true" camera-native dims are runtime data (from meta_000000.txt in local
+# mode, or the gRPC proto in streaming mode) — QuestDataset.__init__
+# overwrites the in-memory dict with those at init time.
+#
+# fx/fy/cx/cy: placeholders only.
+#   * local-file mode: overwritten with meta_000000.txt values at init time
+#     (and cy is flipped from Y-up-viewport to Y-down-image there).
+#   * streaming mode: overwritten from streaming_defaults below (see
+#     QuestDataset.__init__ and the streaming handoff in grpc_server.py).
+camera_params:
+  image_height: 1280            # processing-target resolution (tunable)
+  image_width: 1280             # processing-target resolution (tunable)
+  fx: 0.0
+  fy: 0.0
+  cx: 0.0
+  cy: 0.0
+  png_depth_scale: 1.0         # Quest sends metric depth in meters (float32)
+  crop_edge: 0
+
+# Device-constant defaults used when the gRPC streaming path instantiates
+# QuestDataset without a basedir (scene_name == 'quest'). Quest 3S sensors
+# have factory-fixed intrinsics; these values come from session_0's
+# meta_000000.txt. Update if you switch hardware.
+#
+# cy_yup is the VIEWPORT-Y cy (measured from the image bottom); QuestDataset
+# flips it to image-top (Y-down, OpenCV convention) before scaling.
+streaming_defaults:
+  rgb:
+    image_width: 1280
+    image_height: 1280
+    fx: 859.2350
+    fy: 859.2350
+    cx: 639.1810
+    cy_yup: 637.2878
+  depth:
+    image_width: 320
+    image_height: 320
+    fx: 148.8117
+    fy: 138.9874
+    cx: 171.1883
+    cy_yup: 154.3612

@@ -46,7 +46,11 @@ dataset:
   results_subdir: "results"
 
 frame_processing:
-  default_client_fps: 30
+  # Fallback for ``should_process_frame`` skip math when the upstream proto's
+  # ``fps`` field is 0/unset. Quest streams at ~2 FPS, iPad ~30; per-session
+  # the client-stamped value (UpstreamSyncMessage_*.fps) wins. See
+  # InferenceService.note_client_fps for the freeze.
+  default_client_fps: 2
   initial_frame_index: -1000
   frame_skip_logic: "fps_based"
 
@@ -108,7 +112,15 @@ model:
     precision: "fp16"
     batch_size: 1
     use_trt: false
-    
+    asr:
+      enabled: true
+      # backend: "faster-whisper" (local) | "openai-whisper" (local) | "openai-api" (cloud)
+      backend: "faster-whisper"
+      model: "small.en"         # tiny.en / base.en / small.en / medium.en / large-v3
+      device: "cuda:0"
+      compute_type: "float16"   # faster-whisper only: float16 / int8_float16 / int8
+      warmup: true
+
   mapping:
     device: "cuda:0"  # Device for mapping operations
     mask_conf_threshold: 0.25
@@ -126,7 +138,6 @@ paths:
 debug:
   # Inference results dumping for reproducibility debugging
   dump_inference: false           # Enable dumping of inference results (detections, CLIP features)
-  dump_dir: "./debug_dumps"       # Directory to save debug dumps
   current_scene: null             # Scene name for organized dumps (auto-detected if null)
   config_name: null               # Config name for organized dumps (auto-detected if null)
 

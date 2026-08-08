@@ -7,6 +7,7 @@ from .base import *
 from .ipad import *
 from .replica import *
 from .scannet import *
+from .quest import *
 from .factory import *
 
-__all__ = ["base", "ipad", "replica", "scannet", "factory"]
+__all__ = ["base", "ipad", "replica", "scannet", "quest", "factory"]

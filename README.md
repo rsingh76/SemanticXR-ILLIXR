@@ -92,41 +92,55 @@ add it as a path/git dependency and import `semantic_slam`.
 
 ## Quick Start
 
-**Prerequisites:** Complete the [Installation](#installation) section first to install all dependencies.
+**Prerequisites:** Complete the [Installation](#installation) section first.
 
 ```bash
-# 1. After completing installation, install the package in development mode
+# 1. Install the package in development mode (from repo root)
 pip install -e .
 
-# 2. Run server with default settings
-python server/grpc_server.py --dataset_type replica --useDataset room0
+# 2. Run replay against a captured Quest scene (writes outputs into the
+#    same dataset directory; see "Capture, replay, and run-output layout").
+python server/main.py --dataset_type quest --localDataset \
+    --sceneName dataset_0 --config config/debug/quest_debug.yaml --save_map
 
-# 3. Monitor performance (in another terminal)
-tail -f logs_performance/default/room0/frame_timing.csv
+# 3. Monitor performance (the run dir is printed at startup; tail the latest)
+tail -f $(ls -td datasets/*/*/logs_performance/*/frame_timing.csv \
+                 live_output/*/*/logs_performance/*/frame_timing.csv \
+                 output/*/*/logs_performance/*/frame_timing.csv 2>/dev/null | head -1)
 ```
+
+For live (gRPC) Quest sessions and the broader directory contract, see
+[Capture, replay, and run-output layout](#capture-replay-and-run-output-layout).
 
 ## Project Structure
 
 ```
 semantic-slam-server/
-├── server/                     # gRPC server and components
-│   ├── grpc_server.py         # Main server entry point
-│   └── components/            # Modular server components
-├── slam/                      # Core SLAM functionality
-│   ├── models/                # AI models (detection, segmentation, CLIP)
-│   ├── services/              # Processing pipelines
-│   ├── core/                  # SLAM data structures
-│   └── utils/                 # Utilities and performance monitoring
-├── config/                    # Configuration files
-│   ├── defaults.yaml          # Default settings
-│   ├── replica_config.yaml    # Replica dataset config
-│   └── settings.py            # Configuration system
-├── logs_performance/          # Performance monitoring
-│   └── <config>/<scene>/      # Organized by config and scene
-└── external/                  # External dependencies
-    ├── gradslam/              # Point cloud mapping
-    ├── chamferdist/           # Distance metrics
-    └── Grounded-Segment-Anything/  # Vision models
+├── server/                          # Entry point + gRPC server
+│   ├── main.py                      # Main entry point (live + replay)
+│   ├── components/                  # gRPC handlers, video decoders, inference service
+│   ├── signal_handlers.py
+│   └── xr_service.proto             # gRPC service definition
+├── slam/                            # Core SLAM functionality
+│   ├── models/                      # AI models (detection, segmentation, CLIP, captioning)
+│   ├── services/                    # Inference + visualization pipelines
+│   ├── core/                        # SLAM data structures
+│   ├── datasets/                    # Dataset loaders (Quest, Replica, ScanNet)
+│   └── utils/                       # Perf manager, debug dumps, mapping helpers
+├── config/                          # YAML configuration profiles
+│   ├── defaults.yaml                # Default profile
+│   ├── baseline.yaml                # Single-GPU baseline
+│   ├── parallelization_mobileclip*.yaml   # Faster pipelines (MobileCLIP variants)
+│   └── debug/                       # Debug-enabled variants (quest_debug.yaml, ...)
+├── datasets/<type>/dataset_<N>/     # Captured scenes + replay outputs (runtime-created)
+│   ├── intrinsics.json
+│   ├── decoded_jpg/, depth/, meta/  # per-frame inputs
+│   └── pcd_saves/, debug_dumps/, logs_performance/   # per-replay-run outputs
+├── live_output/<type>/run_<N>/      # Live-stream outputs (runtime-created)
+│   └── pcd_saves/, debug_dumps/, logs_performance/
+├── output/<type>/<scene>/           # Replay outputs for read-only datasets (Replica, ScanNet)
+└── external/                        # Vendored dependencies
+    ├── gradslam/, chamferdist/, Grounded-Segment-Anything/
 ```
 
 ## Installation
@@ -245,7 +259,7 @@ semantic-slam-server/
     **This is the critical step that:**
     - Installs the package in development mode
     - Makes all imports work properly (`from slam.models import ...`)
-    - Enables the server to run (`python server/grpc_server.py`)
+    - Enables the server to run (`python server/main.py`)
     - Must be done AFTER all dependencies are installed
 
 15. **Verify Installation** (optional but recommended):
@@ -254,20 +268,54 @@ semantic-slam-server/
     python tests/test_basic_imports.py
     ```
 
-16. Speech/Audio options and OpenAI key:
+16. Speech/Audio options:
 
-    **Option 1:** Use Audio/Speech. 
-    
-    Set the AUDIO_INPUT_USE_OPENAI flag to "True" in `slam/services/visualization_service.py`
-    
-    Next, you need to create an OpenAI account and key and set the environment variable with your key:
+    ASR is configured via `model.visualization.asr` in your YAML config (see `ASRConfig` in `config/settings.py`). Pick a backend:
+
+    **Option A — openai-whisper with `medium.en` (recommended, best transcription quality in our testing):**
+    ```bash
+    pip install openai-whisper
     ```
+    ```yaml
+    # config/defaults.yaml
+    model:
+      visualization:
+        asr:
+          enabled: true
+          backend: "openai-whisper"
+          model: "medium.en"       # smaller sizes (small.en and below) gave noticeably worse transcripts
+          device: "cuda:0"
+          warmup: true
+    ```
+
+    **Option B — faster-whisper (local, CTranslate2-based, faster in theory but not yet verified end-to-end here — expect to debug before relying on it):**
+    ```bash
+    pip install faster-whisper
+    ```
+    ```yaml
+    asr:
+      enabled: true
+      backend: "faster-whisper"
+      model: "medium.en"           # tiny.en / base.en / small.en / medium.en / large-v3
+      device: "cuda:0"
+      compute_type: "float16"      # float16 / int8_float16 / int8
+      warmup: true
+    ```
+
+    **Option C — OpenAI cloud Whisper:**
+    ```bash
+    pip install openai
     export OPENAI_API_KEY="xxxxxx"
     ```
+    ```yaml
+    asr:
+      enabled: true
+      backend: "openai-api"
+    ```
 
-    **Option 2:** No Audio - go through common workplace objects
-    
-    The server will look for Monitor, Keyboard, Mouse, Laptop, Chair. And keep iterating through the list every time you send a query. You can change this in `slam/services/visualization_service.py`.
+    **Option D — No audio, text queries only:**
+
+    Set `asr.enabled: false`. The client is then expected to send the query as text directly, and the server will skip all audio handling. (For headless testing without a client, the legacy workplace-object iterator path still lives in `clientTextQuery` for the non-`ipad`/`quest` dataset types.)
 
 ## Usage:
 
@@ -290,80 +338,187 @@ detection_model = DetectionModel(config)
 ```
 
 ### **Configuration System**
-The server uses a centralized YAML-based configuration system:
+The server uses a centralized YAML-based configuration system. Pick a profile
+from `config/` and pass it as `--config`; CLI flags override individual values.
 
 ```bash
-# Use default configuration
-python server/grpc_server.py --dataset_type replica --useDataset room0
+# Default profile, replica replay
+python server/main.py --dataset_type replica --localDataset --sceneName room0
 
-# Use custom configuration file
-python server/grpc_server.py --config config/replica_config.yaml --useDataset office1
+# Custom profile
+python server/main.py --config config/parallelization_mobileclip.yaml \
+    --dataset_type quest --localDataset --sceneName dataset_0
 
 # List available options
-python server/grpc_server.py --help
+python server/main.py --help
 ```
 
-**Configuration files are located in `config/`:**
-- `config/defaults.yaml` - Default settings
-- `config/replica_config.yaml` - Replica dataset settings  
-- `config/ipad_config.yaml` - iPad/live capture settings
+**Available config profiles** (see `config/`):
+- `defaults.yaml`, `baseline.yaml` — single-GPU baselines
+- `parallelization_mobileclip.yaml`, `…_objectDownsampling.yaml`, `…_2gpus.yaml` — faster MobileCLIP pipelines
+- `parallelization_origCLIP.yaml` — full CLIP, slower
+- `no_detection.yaml` — pipeline without the detection stage
+- `debug/quest_debug.yaml`, `debug/quest_debug_mobileclip.yaml` — Quest sessions with capture knobs
+- `debug/defaults_debug.yaml`, `debug/debug_parallel_*.yaml`, `debug/parallelization_debug.yaml` — inference-dump-enabled variants for reproducibility debugging
 
 ### **Performance Logging**
-All performance metrics are automatically logged to:
+All performance metrics are logged under the run's output dir
+(``$SLAM_RUN_OUTPUT_DIR``, see *Capture, replay, and run-output layout* below):
 ```
-logs_performance/<config_name>/<scene_name>/
-├── frame_timing.csv          # Detailed per-frame timing data
-└── performance_summary.json  # Session statistics and averages
+<run_output_dir>/logs_performance/<config_name>/
+├── frame_timing.csv          # detailed per-frame timing data
+└── performance_summary.json  # session statistics and averages
 ```
 
 **Examples:**
-- `logs_performance/default/room0/` - Default config, room0 scene
-- `logs_performance/replica_config/office1/` - Custom config, office1 scene
+- ``datasets/quest/dataset_3/logs_performance/default/`` — replay of capture 3, default config
+- ``live_output/quest/run_7/logs_performance/quest_debug/`` — live Quest run 7 with the quest_debug profile
 
 ### **Running the Server**
 
 **Basic usage:**
 ```bash
-# Run with specific dataset
-python server/grpc_server.py --dataset_type replica --useDataset room0
+# Live Quest streaming (gRPC; client connects to this server)
+python server/main.py --dataset_type quest --config config/debug/quest_debug.yaml --save_map
 
-# Run with custom configuration
-python server/grpc_server.py --config config/replica_config.yaml --useDataset office1
+# Live iPad streaming
+python server/main.py --dataset_type ipad --clientUpdateMode --clientIP 192.168.1.100
 
-# Run with iPad/live input
-python server/grpc_server.py --dataset_type ipad --clientUpdateMode --clientIP 192.168.1.100
+# Replay a captured Quest scene (offline; no client needed)
+python server/main.py --dataset_type quest --localDataset \
+    --sceneName dataset_0 --config config/debug/quest_debug.yaml --save_map
+
+# Replay a Replica scene (REPLICA_ROOT must be exported)
+python server/main.py --dataset_type replica --localDataset --sceneName room0 --save_map
 ```
 
 **Key command-line options:**
-- `--config <path>` - Use custom YAML configuration file
-- `--useDataset <name>` - Process specific dataset (enables scene-based logging)
-- `--dataset_type <type>` - Dataset type: `replica`, `ipad`, etc.
-- `--clientUpdateMode` - Enable real-time client updates
-- `--clientIP <ip>` - Client IP address for updates
-- `--pipelined_mapping` - Enable pipelined mapping mode
+- `--dataset_type <type>` — required, one of `quest`, `ipad`, `replica`, `scannet`
+- `--config <path>` — YAML profile (default `config/defaults.yaml`)
+- `--localDataset` — replay mode (read from disk instead of gRPC)
+- `--sceneName <name>` — scene directory name; for Quest, this is `dataset_<N>` under `datasets/quest/`
+- `--save_map` — write the final semantic-map pickle on completion
+- `--dataset_stride <N>` — process every Nth frame in replay (default 5)
+- `--test_depth_downsampling <N>` — override mapping depth-downsample factor; baked into output filename for sweeps
+- `--clientUpdateMode` / `--clientIP` — enable client-side viz updates (live mode)
+- `--pipelined_mapping` — use pipelined mapping consumer
 
 **Performance monitoring:**
 - Real-time FPS and timing statistics logged to console
-- Detailed CSV logs for analysis: `logs_performance/<config>/<scene>/frame_timing.csv`
+- Detailed CSV logs at ``$SLAM_RUN_OUTPUT_DIR/logs_performance/<config>/frame_timing.csv`` (see *Capture, replay, and run-output layout* below)
 - Graceful shutdown on Ctrl+C with final performance summary
+
+### **Capture, replay, and run-output layout**
+
+The server organises every run's artifacts under a single per-run directory
+so a parameter-sweep workflow (capture once, replay many) keeps inputs and
+outputs co-located. ``server/main.py`` resolves this directory at startup
+and exports it as ``SLAM_RUN_OUTPUT_DIR``; everything written by the
+inference workers — pcd dumps, debug dumps, perf logs — hangs off it.
+
+**Top-level layout:**
+
+```
+datasets/                            # capture sinks AND replay sources
+  quest/
+    dataset_0/                       # one captured scene
+      intrinsics.json                # scene-level RGB + depth intrinsics + sizes (cy_yup)
+      decoded_jpg/frame_NNNNNN.jpg   # RGB at NATIVE resolution
+      depth/depth_NNNNNN.npy         # float32 metric depth at NATIVE depth resolution
+      meta/meta_NNNNNN.json          # per-frame poses (as received) + timestamps
+      pcd_saves/                     # ← replay semantic-map output
+      debug_dumps/{inference,visualizations}/   # ← replay debug artifacts
+      logs_performance/<config>/     # ← replay perf logs
+    dataset_1/ ...
+  ipad/
+    dataset_0/{results/, traj.txt}   # iPad capture (no replay path today)
+    dataset_1/ ...
+
+live_output/                         # live-stream artifacts only
+  quest/
+    run_0/{pcd_saves/, debug_dumps/, logs_performance/<config>/}
+    run_1/ ...
+  ipad/
+    run_0/ ...
+```
+
+Auto-increment is per-type: ``datasets/quest/dataset_0`` and
+``datasets/ipad/dataset_0`` exist independently. ``run_<N>`` under
+``live_output/<type>/`` increments separately.
+
+**To capture a live Quest session:**
+
+Set ``dataset.enabled=true`` (off by default). Quest frames land under
+``datasets/quest/dataset_<N>/`` automatically. Live-run outputs (semantic
+map, debug dumps, perf logs) go to ``live_output/quest/run_<N>/``.
+
+What's saved vs what's used at runtime:
+- **Poses**: stored exactly as the proto delivers them (OpenXR right-handed,
+  Y-up, camera-to-world). The OpenGL→OpenCV flip lives in
+  ``QuestDataset.load_poses`` and runs at consumption time — same call site
+  for live and replay, so there's no risk of double-flip.
+- **Depth**: stored before ``build_depth_in_rgb_frame``. Replay re-runs the
+  alignment with whatever target resolution ``QUEST.yaml`` specifies, so you
+  can change processing resolution between runs without re-capturing.
+- **RGB**: stored at native resolution (no LANCZOS pre-resize), for the
+  same reason.
+
+**To replay a captured scene:**
+
+```bash
+python server/main.py --localDataset --dataset_type quest --sceneName dataset_0 --save_map
+```
+
+The replay loop in ``server/main.py::_process_quest_dataset`` finds frames
+by globbing ``meta_*.json`` under ``datasets/quest/<sceneName>/``, runs
+them through the same inference pipeline as live, and emits a
+``scene_completion`` signal at the end so the inference worker writes the
+final semantic map to:
+
+```
+datasets/quest/<sceneName>/pcd_saves/semantic_map_<config>_test_depth_downsampling_<N>.pkl.gz
+```
+
+Per-stage timings land at
+``datasets/quest/<sceneName>/logs_performance/<config>/frame_timing.csv``.
+Note that ``queue_overhead`` and ``total_time`` are not directly comparable
+between live and replay (live has backpressure / drops; replay processes
+sequentially).
 
 ## Configuration Details
 
 ### **Environment Variables**
-The system supports environment variable overrides for any configuration value:
+A subset of config fields can be overridden via environment variables (handled
+in `Config.from_env`, [config/settings.py](config/settings.py)):
 
 ```bash
-# Override model devices
-export SLAM_MODEL_DETECTION_DEVICE="cuda:1"
-export SLAM_MODEL_SEGMENTATION_DEVICE="cuda:0"
+# Per-stage device overrides (also DEVICE for a global override)
+export DETECTION_DEVICE="cuda:1"
+export SEGMENTATION_DEVICE="cuda:0"
+export CLIP_DEVICE="cuda:0"
+export CAPTIONING_DEVICE="cuda:0"
+export VISUALIZATION_DEVICE="cuda:0"
+export MAPPING_DEVICE="cuda:0"
 
-# Override server settings  
-export SLAM_SERVER_TARGET_FPS=15
-export SLAM_SERVER_PORT=50051
+# Model variant overrides
+export SAM_VARIANT="mobilesam"
+export CLIP_MODEL="ViT-H-14"
 
-# Run server with overrides
-python server/grpc_server.py --useDataset room0
+# Server / external paths
+export SERVER_PORT=50051
+export GSA_PATH=/path/to/Grounded-Segment-Anything
+
+# Replica / ScanNet replay roots (read-only public datasets)
+export REPLICA_ROOT=/path/to/Replica
+export SCANNET_ROOT=/path/to/ScanNet
+
+# Debug dump toggles
+export DEBUG_DUMP_INFERENCE=true
+export DEBUG_USE_SLOW_VIS=true
 ```
+
+These layer in on top of the YAML config. For values not exposed as env vars,
+edit the YAML or pass `--<flag>` overrides where wired.
 
 ### **Model Configuration**
 Each AI model can be configured independently:
@@ -406,8 +561,10 @@ python -c "from slam.models import SegmentationModel; print('✅ Imports working
 # Check GPU utilization
 nvidia-smi
 
-# Monitor performance logs
-tail -f logs_performance/default/room0/frame_timing.csv
+# Monitor performance logs (the run dir is printed at startup; tail the latest)
+tail -f $(ls -td datasets/*/*/logs_performance/*/frame_timing.csv \
+                 live_output/*/*/logs_performance/*/frame_timing.csv \
+                 output/*/*/logs_performance/*/frame_timing.csv 2>/dev/null | head -1)
 ```
 
 **Configuration Issues:**
@@ -428,3 +585,37 @@ This repository is being migrated to Apache-2.0. The Python package and every de
 - **NVIDIA proprietary runtime SDKs**: CUDA, cuDNN, NCCL, TensorRT, and the NVIDIA Video Codec SDK are required runtime dependencies but are not redistributed by this repository.
 
 For the full dependency inventory and SPDX identifiers, see [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md).
+
+## TODOs — Visualization Path
+
+Follow-ups identified while moving point-cloud downsampling from query-time
+random-200 to receive-time iterative voxel (in `slam/services/visualization_service.py`):
+
+- **Lift voxel constants into config.** `_voxel_downsample_iterative` currently
+  hardcodes `voxel=0.03 m`, `cap=150`, `growth=1.5`, `max_iters=8`. These are
+  good defaults but should live under `config.model.visualization` so they can
+  be tuned per dataset alongside `similarity_threshold`, `colormap`, etc.
+- **Scene-total point cap.** Per-object cap is in place via the iterative
+  voxel; the next layer is a scene-total cap on the query response — sort
+  matched objects by similarity, then further-downsample (or drop) once the
+  total point budget is exceeded. Place: right before `createGRPCResponse`
+  returns in `clientTextQuery`.
+- **Populate `PointCloud.centroid` on the query response.** It's currently
+  hardcoded to `[0, 0, 0]` in `createGRPCResponse` and on every push-path
+  callsite (`generateClientUpdate`, `_compute_update_message_size_mbits`).
+  The proto field is already there; just compute `pcd.mean(axis=0)` before
+  the rebind that sub-samples (so it reflects the full point set).
+- **Fix misleading comment in inference output.** `inference_pipeline.py:531`
+  and `mapping_server.py:337` describe `fresh_objects` as "index of all
+  objects that have been touched/edited/added" — they're actually
+  `history_idx` values, not current indices. The visualization cache keyed by
+  history_idx depends on this; a future "cleanup" that takes the comment
+  literally would silently break invalidation.
+- **Optional: Open3D-style averaging in voxel downsample.** Current numpy
+  implementation uses "first index wins" per voxel cell, which is fine for
+  sparse translucent rendering but slightly biased compared to Open3D's
+  per-cell averaging. Worth revisiting only if the bias ever becomes visible.
+- **Cache memory bound.** `self._downsampled_cache` grows with object count
+  (~3.6 KB per object at 150 points × 3 floats × 8 B). Auto-evicts deleted
+  objects each frame, but a hard max-size guard would be defensive if scenes
+  ever scale to thousands of objects.

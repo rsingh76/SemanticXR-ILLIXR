@@ -40,6 +40,15 @@ class FrameTimingData:
     clip_mapping: float = 0.0
     queue_overhead: float = 0.0  # Data transfer and queue waiting time
     total_time: float = 0.0
+    # Per-frame mapping breakdown (0.0 when the stage is skipped that frame).
+    gobs_creation_time: float = 0.0
+    similarity_time: float = 0.0
+    merging_time: float = 0.0
+    post_process_denoise_time: float = 0.0
+    filter_objects_time: float = 0.0
+    merge_objects_time: float = 0.0
+    post_processing_time: float = 0.0
+    num_objects: int = 0
     server_timestamp: Optional[int] = None
     client_timestamp: Optional[int] = None
     queue_sizes: Optional[Dict[str, int]] = None
@@ -114,38 +123,49 @@ class PerformanceManager:
         print(f"   Console updates every {self.console_log_interval} frames")
     
     def _setup_log_directory(self) -> Path:
-        """Setup log directory based on configuration."""
-        # Use absolute path from config directory, not current working directory
-        if hasattr(self.config, 'logging') and hasattr(self.config.logging, 'log_directory'):
-            base_dir = Path(self.config.logging.log_directory)
-            if not base_dir.is_absolute():
-                # Make relative to project root (parent of slam/ directory)
-                project_root = Path(__file__).parent.parent.parent
-                base_dir = project_root / base_dir
-        else:
-            # Fallback to project root
-            project_root = Path(__file__).parent.parent.parent  
-            base_dir = project_root / "logs_performance"
-        
-        # Get config file name for directory structure: logs_performance/<config_file>/
+        """Setup log directory.
+
+        Performance logs live alongside the run's other artifacts:
+        ``$SLAM_RUN_OUTPUT_DIR/logs_performance/<config_name>/``. The run
+        root encodes scene/run identity already, so we don't repeat it here;
+        we keep ``<config_name>`` as a leaf so multiple configs against the
+        same scene don't stomp on each other.
+        """
+        run_dir = os.environ.get('SLAM_RUN_OUTPUT_DIR')
+        if not run_dir:
+            raise RuntimeError(
+                "SLAM_RUN_OUTPUT_DIR is not set. server/main.py must export it "
+                "before the inference workers start."
+            )
         config_name = os.environ.get('SLAM_CONFIG_NAME', 'default')
-        
-        # Create scene-based subdirectory: logs_performance/<config_file>/<scene_name>/
-        if self.scene_name:
-            # Use specific scene name (e.g., "room0", "office1")
-            scene_name = self.scene_name
-        else:
-            # Access dataset type from config (it's a dataclass, not dict)
-            try:
-                scene_name = getattr(self.config.dataset, 'type', 'unknown')
-            except AttributeError:
-                scene_name = 'unknown'
-        
-        # Three-level directory structure
-        log_dir = base_dir / config_name / scene_name
+        log_dir = Path(run_dir) / 'logs_performance' / config_name
         log_dir.mkdir(parents=True, exist_ok=True)
         return log_dir
     
+    def rebind_run_dir(self, new_run_dir: str):
+        """Point this PerformanceManager at a fresh run_<N>/ directory.
+
+        Used by the scene_completion handlers when each client disconnect should
+        produce its own run dir. Closes accumulated in-memory state, re-resolves
+        the log directory, and re-opens log files. Caller is responsible for
+        having flushed the previous scene's summary first
+        (write_scene_summary_and_reset).
+        """
+        new_log_dir = Path(new_run_dir) / 'logs_performance' / os.environ.get('SLAM_CONFIG_NAME', 'default')
+        new_log_dir.mkdir(parents=True, exist_ok=True)
+        with self._data_lock:
+            self.log_directory = new_log_dir
+            # Reset session-level state so the new run starts clean.
+            self.frame_data.clear()
+            self.recent_frames.clear()
+            self.stats.clear()
+            self.frame_count = 0
+            self.start_time = time.time()
+            self._cleanup_done = False
+            self._update_sizes_count = 0
+        self.setup_logging()
+        print(f"🔄 PerformanceManager rebound to {new_log_dir}")
+
     def setup_logging(self):
         """Initialize log files."""
         # Fixed file names without timestamps (always append to same files)
@@ -156,8 +176,25 @@ class PerformanceManager:
         self._csv_fieldnames = [
             'frame_number', 'timestamp', 'caption_time', 'detection_time',
             'segmentation_time', 'clip_time', 'mapping_time', 'clip_mapping',
-            'queue_overhead', 'total_time', 'server_timestamp', 'client_timestamp'
+            'queue_overhead', 'total_time',
+            'gobs_creation_time', 'similarity_time', 'merging_time',
+            'post_process_denoise_time', 'filter_objects_time',
+            'merge_objects_time', 'post_processing_time', 'num_objects',
+            'server_timestamp', 'client_timestamp'
         ]
+        # If an older CSV exists with a mismatched header, rotate it aside so
+        # we don't append incompatible rows (DictWriter would silently drop
+        # or reorder fields and downstream pandas parsing would break).
+        if self.csv_file.exists():
+            try:
+                with open(self.csv_file, 'r', newline='') as f:
+                    existing_header = next(csv.reader(f), [])
+                if existing_header != self._csv_fieldnames:
+                    backup = self.csv_file.with_suffix('.csv.legacy')
+                    self.csv_file.replace(backup)
+                    print(f"ℹ️  Rotated legacy frame_timing.csv → {backup.name} (schema changed)")
+            except Exception as e:
+                print(f"⚠️  Could not inspect existing CSV header: {e}")
         if not self.csv_file.exists():
             with open(self.csv_file, 'w', newline='') as f:
                 writer = csv.DictWriter(f, fieldnames=self._csv_fieldnames)
@@ -224,6 +261,14 @@ class PerformanceManager:
                 clip_mapping=timing_dict.get('clip_mapping', 0.0),
                 queue_overhead=timing_dict.get('queue_overhead', 0.0),
                 total_time=timing_dict.get('total_time', 0.0),
+                gobs_creation_time=timing_dict.get('gobs_creation_time', 0.0),
+                similarity_time=timing_dict.get('similarity_time', 0.0),
+                merging_time=timing_dict.get('merging_time', 0.0),
+                post_process_denoise_time=timing_dict.get('post_process_denoise_time', 0.0),
+                filter_objects_time=timing_dict.get('filter_objects_time', 0.0),
+                merge_objects_time=timing_dict.get('merge_objects_time', 0.0),
+                post_processing_time=timing_dict.get('post_processing_time', 0.0),
+                num_objects=int(timing_dict.get('num_objects', 0)),
                 server_timestamp=server_timestamp,
                 client_timestamp=client_timestamp,
                 queue_sizes=queue_sizes,
@@ -234,9 +279,12 @@ class PerformanceManager:
             self.recent_frames.append(current_time)
             self.frame_count += 1
             
-            # Update statistics
+            # Update statistics. ``timing_dict`` is meant to hold numeric
+            # per-stage timings, but upstream producers occasionally shove
+            # metadata dicts in by mistake — skip any non-numeric entries
+            # rather than take the worker down.
             for key, value in timing_dict.items():
-                if value > 0:  # Only track positive timing values
+                if isinstance(value, (int, float)) and value > 0:
                     self.stats[key].append(value)
             
             # Write to CSV (thread-safe)

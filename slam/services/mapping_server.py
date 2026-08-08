@@ -8,6 +8,7 @@ import asyncio
 import grpc
 import os
 import sys
+import threading
 import time
 from concurrent import futures
 from pathlib import Path
@@ -27,6 +28,7 @@ from slam.utils.vis import OnlineObjectRenderer
 from slam.utils.ious import compute_2d_box_contained_batch
 from slam.utils.general_utils import to_tensor, to_numpy
 from slam.utils.debug_utils import dump_semantic_map
+from slam.utils.performance_manager import get_performance_manager
 from slam.core.slam_classes import MapObjectList, DetectionList
 from slam.core.utils import (
     merge_obj2_into_obj1, 
@@ -43,15 +45,47 @@ from slam.core.mapping import (
     merge_detections_to_objects
 )
 
-from slam.utils.mapping_utils import get_dataset, setup
+from slam.utils.mapping_utils import BG_CLASSES, get_dataset, init_clip_ignore_filter, resolve_session_max_depth, setup
 
-BG_CLASSES = ["wall", "floor", "ceiling"]
 ASYNC_IO=True
 DEBUG_PRINT = False
 def debug_print(*args, **kwargs):
     if DEBUG_PRINT:
         print(*args, **kwargs)
-   
+
+
+def _wake_viz_consumer(address='localhost:50054', connect_timeout=120.0):
+    """Ensure viz is reachable then fire its updateMap drain loop.
+
+    Mirrors inference_pipeline._wake_viz_consumer so pipelined mode has the
+    same handshake. Without this, viz's drain loop only starts when the client
+    sends updateMap, leaving a window where pushed frames sit in the queue and
+    early text queries race ahead of the first map update.
+
+    Blocks until viz is reachable (or connect_timeout elapses), then fires the
+    actual RPC on a daemon thread because viz's updateMap is a forever loop.
+    """
+    channel = grpc.insecure_channel(address)
+    try:
+        grpc.channel_ready_future(channel).result(timeout=connect_timeout)
+    except grpc.FutureTimeoutError:
+        print(f"⚠️  [MAPPING] Viz server at {address} not reachable within "
+              f"{connect_timeout:.0f}s; drain loop won't start. Frames will be dropped.")
+        return None
+
+    stub = vis_pb2_grpc.VisualizerServerStub(channel)
+
+    def _runner():
+        try:
+            stub.updateMap(vis_pb2.Status(message=True))
+        except grpc.RpcError as e:
+            debug_print(f"[MAPPING] viz wake RPC closed: {e.code() if hasattr(e, 'code') else e}")
+
+    t = threading.Thread(target=_runner, name="viz-wakeup", daemon=True)
+    t.start()
+    print(f"✅ [MAPPING] Viz server reachable at {address}; drain loop started.")
+    return t
+
 
 def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datasetClass="iPad", save_map=False, experiment_config=None, scene_name=None):
     # Set the config globally so utils.py can access it
@@ -60,6 +94,7 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
         set_config(experiment_config)
     
     cfg = setup(useDetector, datasetClass)
+    init_clip_ignore_filter(cfg, experiment_config)
     dataset = get_dataset(
         datasetClass=datasetClass,
         config_dict = cfg.dataset_config,
@@ -83,22 +118,17 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
     history_map = {}                # Idx to object mapping. Key: idx, Value: None, or index in the obj list. If an object is removed then the value is set to None. If an object is edited, then this provides a consistent mapping to client; # keys are the indices of the objects when they were first added to the map (uniqueID/'history_idx'), values are the indices of the objects in the current ObjList
     next_index = 0
     objects = MapObjectList(device=cfg.device)
-    
-    
-    if ASYNC_IO:
-        made_grpc_call = False
-        # For sending the results to mapping server
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        channel = grpc.aio.insecure_channel('localhost:50054')
-    else:
-        channel = grpc.insecure_channel('localhost:50054')
-    
-    
-    # Create a gRPC channel and stub
-    # channel = grpc.insecure_channel('localhost:50054') 
-    stub = vis_pb2_grpc.VisualizerServerStub(channel)
     skipped_frames = 0
+
+    # Wake viz's drain loop before frames start flowing — same handshake as
+    # the non-pipelined path uses in inference_pipeline.py. The wake function
+    # owns its own channel + daemon thread so we don't keep one in this scope.
+    _wake_viz_consumer()
+
+    # Frame-timing logs live here (mirrors inference_pipeline.py:246) so every
+    # processed frame is captured, not just ones that fit in the viz queue.
+    perf_mgr = get_performance_manager(scene_name=scene_name)
+
     print("*****************************************************[Mapping Consumer Started]*****************************************************")
     print("Configuration:")
     print(f"[MAPPING SERVER] useDetector: {useDetector}")
@@ -108,7 +138,14 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
     print(f"[MAPPING SERVER] skip_bg: {cfg.skip_bg}")
     print(f"[MAPPING SERVER] mask_conf_threshold: {cfg.mask_conf_threshold}")
     print(f"[MAPPING SERVER] test_depth_downsampling: {experiment_config.model.mapping.test_depth_downsampling}")
-    
+    print(f"[MAPPING SERVER] voxel size: {cfg.downsample_voxel_size}")
+
+    # Session-scoped freeze for the client-stamped depth cap. The FIRST frame
+    # of each session locks the value via resolve_session_max_depth(); later
+    # per-frame stamps are silently ignored. Reset on scene_completion.
+    _UNSET_CAP = object()
+    session_max_depth_m = _UNSET_CAP
+
     while True:
             
         # TODO - Dequeue the results from the queue
@@ -122,13 +159,26 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
             scene_name = queue_item['scene_name']
             print(f"🎯 [MAPPING] Received scene completion signal for {scene_name}")
             print(f"🧹 [MAPPING] Saving map data for {scene_name} (has {len(objects)} objects)")
-            
-            # Dump semantic map BEFORE clearing anything
-            # For mapping server, we don't have accumulated classes like inference pipeline
-            # Use a default class list for consistency
-            scene_classes = ['item']  # Default for mapping server
+
+            # Real class list now comes from inference (captioning lives there in
+            # pipelined mode). Falls back to ['item'] if upstream didn't send one
+            # (e.g. useDetector=False or empty global_classes).
+            scene_classes = queue_item.get('scene_classes') or ['item']
+
+            # Dump uses the CURRENT env var, so it lands in the OLD run_dir.
             dump_semantic_map(scene_name, objects, bg_objects, cfg, scene_classes, save_map, test_depth_downsampling=experiment_config.model.mapping.test_depth_downsampling)
-            
+
+            # Flush per-scene performance summary (still in OLD run_dir).
+            perf_mgr.write_scene_summary_and_reset(scene_name)
+
+            # Now switch to the next session's run_dir if the signal carries one,
+            # so subsequent dumps and frame_timing rows land in run_<N+1>/.
+            new_run_dir = queue_item.get('run_output_dir')
+            if new_run_dir:
+                os.environ['SLAM_RUN_OUTPUT_DIR'] = new_run_dir
+                perf_mgr.rebind_run_dir(new_run_dir)
+                print(f"🔄 [MAPPING] Run dir → {new_run_dir}")
+
             # Now clear accumulated map data for next scene
             objects.clear()
             if not cfg.skip_bg:
@@ -138,18 +188,34 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
             history_map = {}
             next_index = 0
             idx = 0
-            
+            # Reset the session cap on session boundary; the next client's
+            # first frame will re-resolve client-stamp ⨯ cfg.max_depth_m.
+            session_max_depth_m = _UNSET_CAP
+
             # Forward completion signal to visualization queue
             visualizationQueue.put(queue_item)
             continue
-            
+
         # Check if this is a shutdown signal
         if isinstance(queue_item, dict) and queue_item.get('type') == 'shutdown':
             print("🏁 [MAPPING] Received shutdown signal. Exiting...")
+            perf_mgr.cleanup()
             visualizationQueue.put(queue_item)  # Forward to visualization
             break
             
-        results, depth_np_array, poseString, frameNumber, image_pil, global_classes, starting_timestamp, clientTimeStamps, time_dict = queue_item
+        # 10-slot tuple: slot 10 is the per-frame client wire stamp
+        # (Optional[float]; None = "client didn't specify"). See
+        # slam/services/inference.py for the producer.
+        results, depth_np_array, poseString, frameNumber, image_pil, global_classes, starting_timestamp, clientTimeStamps, time_dict, client_max_depth_m = queue_item
+
+        # Read once per session, freeze, then ignore later per-frame stamps.
+        if session_max_depth_m is _UNSET_CAP:
+            session_max_depth_m = resolve_session_max_depth(client_max_depth_m, cfg)
+            if session_max_depth_m is None:
+                print(f"[MAPPING SERVER]\t\t Mapping depth cap (session): NONE (no cap)")
+            else:
+                print(f"[MAPPING SERVER]\t\t Mapping depth cap (session): {session_max_depth_m:.3f} m")
+        max_depth_m = session_max_depth_m
         debug_print("[MAPPING SERVER]\t\tProcessing frame-------: ", frameNumber, "  Lagging by : ", mappingQueue.qsize(), " frames")
         start_time = time.perf_counter_ns()
 
@@ -190,6 +256,7 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
             class_names = classes,
             BG_CLASSES = BG_CLASSES,
             color_path = None,
+            max_depth_m = max_depth_m,
         )
         
         if len(bg_detection_list) > 0:
@@ -261,10 +328,16 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
             denoise_end = time.perf_counter_ns()
             time_dict['post_process_denoise_time'] = (denoise_end - denoise_start)/1e6
         if cfg.filter_interval > 0 and (idx+1) % cfg.filter_interval == 0:
+            filter_start = time.perf_counter_ns()
             objects,removed_obj_1, history_map = filter_objects(cfg, objects, history_map)
+            time_dict['filter_objects_time'] = (time.perf_counter_ns() - filter_start)/1e6
         if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
+            merge_objs_start = time.perf_counter_ns()
             objects, removed_object_2, edited_objects_idx_2, history_map = merge_objects(cfg, objects, history_map)
-        
+            # O(N^2) pairwise FAISS overlap step — main super-linear term.
+            time_dict['merge_objects_time'] = (time.perf_counter_ns() - merge_objs_start)/1e6
+        time_dict['num_objects'] = len(objects)
+
         idx += 1
         
         final_removed_objects = removed_obj_1 + removed_object_2
@@ -293,45 +366,34 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
         }
         
         
-        result_serialization_time = time.perf_counter_ns()      
-        
+        result_serialization_time = time.perf_counter_ns()
+
+        # Populate timing keys BEFORE the queue.full check so dropped frames
+        # are still represented in frame_timing.csv (parity with non-pipelined).
+        time_dict['mapping_time'] = (result_serialization_time - start_time) / 1e6
+        time_dict['post_processing_time'] = (pre_serial_time - mergin_end) / 1e6
+        # total_time spans from frame entering the system (gRPC ingress) to
+        # results serialized — the e2e analogue of inference_pipeline's
+        # total_time, which measures the same span when inference + mapping
+        # share a process.
+        time_dict['total_time'] = (result_serialization_time - starting_timestamp) / 1e6
+
+        # Log timing here, not in the viz consumer, so we capture every
+        # processed frame regardless of viz queue backpressure.
+        perf_mgr.log_frame_timing(
+            frame_number=frameNumber,
+            timing_dict=time_dict,
+            server_timestamp=time.perf_counter_ns(),
+            client_timestamp=clientTimeStamps,
+        )
+
         if visualizationQueue.full():
             skipped_frames += 1
             print(f"⚠️  [MAPPING→VISUALIZATION] Queue full! Dropping frame {frameNumber}. Total skipped: {skipped_frames}")
             print(f"    Frame details: {len(fg_detection_list)} objects detected, {len(objects)} total objects")
-            continue  
-        time_dict['mapping_time'] = (result_serialization_time - start_time)/1e6
-        time_dict['post_processing_time'] = (pre_serial_time - mergin_end)/1e6   
+            continue
 
         visualizationQueue.put((results, frameNumber, starting_timestamp, clientTimeStamps, time_dict))
-        
-        
-        async def makeGRPCCall():   
-            # Create the request message
-            vis_request = vis_pb2.Status(message=True)
-
-            # Send the request to the visualization server
-            try:
-                response = stub.updateMap(vis_request)
-                # print(f"Visualization server response: {response.message}")
-            except grpc.RpcError as e:
-                print(f"gRPC error: {e}")
-        
-        if ASYNC_IO:
-            if not made_grpc_call:
-                loop.run_until_complete(makeGRPCCall())
-                made_grpc_call = True
-        else:
-            
-            # Create the request message
-            vis_request = vis_pb2.Status(message=True)
-
-            # Send the request to the visualization server
-            try:
-                response = stub.updateMap(vis_request)
-                debug_print(f"Visualization server response: {response.message}")
-            except grpc.RpcError as e:
-                debug_print(f"gRPC error: {e}")
         grpcs_time = time.perf_counter_ns()
         
         # debug_print(f"[MAPPING SERvER] Frame {idx}: Detected {len(fg_detection_list)} objects. Total objects: {len(objects)}, Time taken for computation: {(end_compute - start_time)/1e6} ms, Serialization: {(result_serialization_time - end_compute)/1e6} ms, gRPC: {(grpcs_time - result_serialization_time)/1e6} ms")

@@ -8,19 +8,21 @@ from typing import Dict, Any, Optional
 
 from .replica import ReplicaDataset
 from .scannet import ScanNetDataset
+from .quest import QuestDataset
 
 
 class DatasetFactory:
     """Factory class for creating local dataset instances.
-    
-    Note: iPad is not included as it uses real-time streaming, not local file processing.
-    iPad datasets are directly instantiated in the streaming services.
+
+    Note: iPad and Quest are not included as they use real-time streaming, not local file processing.
+    They are directly instantiated in the streaming services.
     """
-    
+
     # Registry of available local datasets
     DATASETS = {
         'replica': ReplicaDataset,
         'scannet': ScanNetDataset,
+        'quest': QuestDataset,
     }
     
     @classmethod
@@ -83,6 +85,8 @@ class DatasetProcessor:
             return DatasetProcessor._get_replica_paths(scene_name)
         elif dataset_type == 'scannet':
             return DatasetProcessor._get_scannet_paths(scene_name)
+        elif dataset_type == 'quest':
+            return DatasetProcessor._get_quest_paths(scene_name)
         else:
             raise ValueError(f"Unsupported dataset type for local file processing: {dataset_type}. iPad uses real-time streaming.")
     
@@ -123,6 +127,27 @@ class DatasetProcessor:
     
 
     @staticmethod
+    def _get_quest_paths(scene_name: str) -> Dict[str, str]:
+        """Get Quest replay paths under ``<dataset.output_directory>/quest/<scene_name>/``.
+
+        Quest captures are written by ``SLAMGRPCServer._save_quest_replay_frame``
+        directly into this layout, so replay reads from the same place capture
+        wrote — no env var required.
+        """
+        from config.settings import get_config
+        cfg = get_config()
+        dataset_path = os.path.join(cfg.dataset.output_directory, 'quest', scene_name)
+        assert os.path.exists(dataset_path), f"Dataset path {dataset_path} does not exist"
+        return {
+            'dataset_path': dataset_path,
+            'image_path': os.path.join(dataset_path, "decoded_jpg"),
+            'depth_path': os.path.join(dataset_path, "depth"),
+            'meta_path': os.path.join(dataset_path, "meta"),
+            # ``intrinsics.json`` stays at the scene root (one level up from
+            # meta_path); load_quest_meta looks for it via dirname(meta_path).
+        }
+
+    @staticmethod
     def get_default_scenes(dataset_type: str) -> list:
         """Get default scene names for a dataset type.
         
@@ -139,7 +164,7 @@ class DatasetProcessor:
         elif dataset_type == 'scannet':
             # ScanNet scenes would need to be discovered dynamically or configured
             return ["scene0011_00"]  # Return empty list for now, to be filled based on available scenes
-        elif dataset_type == 'ipad':
-            return []  # iPad scenes are typically custom recorded scenes
+        elif dataset_type in ('ipad', 'quest'):
+            return []  # Streaming datasets - scenes are recorded in real-time
         else:
             raise ValueError(f"Unsupported dataset type: {dataset_type}")

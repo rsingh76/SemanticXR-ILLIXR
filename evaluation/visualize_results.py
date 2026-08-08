@@ -76,7 +76,10 @@ def load_result(result_path):
             bg_objects = MapObjectList()
             bg_objects.load_serializable(results["bg_objects"])
 
-        class_colors = results['class_colors']
+        # Normalize keys to str; color_by_class looks up class_colors[str(id)]
+        # but dump_semantic_map writes int keys. The list-branch below already
+        # does this; the dict-branch needed to match.
+        class_colors = {str(k): v for k, v in results['class_colors'].items()}
     elif isinstance(results, list):
         objects = MapObjectList()
         objects.load_serializable(results)

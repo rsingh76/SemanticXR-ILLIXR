@@ -34,8 +34,11 @@ class VideoProcessor:
         self.dataset_depth_width = self.config.video.dataset_depth_width
         self.sharpness_threshold = self.config.video.sharpness_threshold
         
-        # Initialize video decoder
+        # Initialize video decoders. iPad / dataset paths stream H.264;
+        # Meta Quest streams H.265 (HEVC). Each decoder is stateful so we
+        # can't share one instance across codecs.
         self.h264_decoder = VideoDecoder('h264')
+        self.h265_decoder = VideoDecoder('h265')
         
         # Setup temp directory from config
         self.temp_output_dir = self.config.video.temp_output_dir
@@ -108,18 +111,24 @@ class VideoProcessor:
         
         return image_path, depth_path
     
-    def process_video_frame(self, frame_data: bytes) -> Tuple[Optional[np.ndarray], bool]:
+    def process_video_frame(self, frame_data: bytes, codec: str = 'h264') -> Tuple[Optional[np.ndarray], bool]:
         """Process raw video frame data.
-        
+
         Args:
             frame_data: Raw video frame bytes
-            
+            codec: 'h264' (iPad / dataset streams) or 'h265' (Meta Quest).
+
         Returns:
-            Tuple of (processed_frame, is_valid)
+            Tuple of (processed_frame, is_valid). ``is_valid`` is the
+            Laplacian-variance sharpness gate used to reject hand-shake blur on
+            iPad streams. Quest is head-mounted with VIO, and its H.265
+            compression produces much lower Laplacian variance even on crisp
+            content (~18 vs ~>>100 for iPad). The gate was never meaningful for
+            Quest, so we bypass it when codec=='h265'.
         """
         try:
-            # Decode frame using h264 decoder
-            decoded_frames = self.h264_decoder.decode_frame(frame_data)
+            decoder = self.h265_decoder if codec == 'h265' else self.h264_decoder
+            decoded_frames = decoder.decode_frame(frame_data)
             
             if not decoded_frames:
                 return None, False
@@ -127,10 +136,10 @@ class VideoProcessor:
             # Get the first frame (numpy array, RGB HWC, from NVDEC)
             decoded_frame = decoded_frames[0]
             
-            # Check if frame is sharp enough
-            if not self.is_frame_sharp_enough(decoded_frame):
+            # Sharpness gate: skip for Quest (see docstring).
+            if codec != 'h265' and not self.is_frame_sharp_enough(decoded_frame):
                 return decoded_frame, False
-                
+
             return decoded_frame, True
             
         except Exception as e:
