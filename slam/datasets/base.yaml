@@ -41,24 +41,37 @@ mask_conf_threshold: 0.95 # mask with lower confidence score will be skipped
 max_bbox_area_ratio: 0.5 # boxes with larger areas than this will be skipped
 skip_bg: !!bool True
 
-# Ignore list: mask classes dropped entirely from the pipeline before mapping.
-# Separate from BG_CLASSES (wall/floor/ceiling), which are fused as a single
-# per-class background object when skip_bg is false. Filtering happens inside
-# filter_gobs() (slam/core/utils.py) AFTER SAM + CLIP, so humans are still
-# segmented and embedded — they are just never integrated into the map.
-# Dataset-level overrides in e.g. QUEST.yaml are promoted onto the root cfg
+# --- Three-layer ignore architecture (drop humans / unwanted classes) ---
+# Layers fire at progressively later stages and are independently togglable.
+# Dataset-level overrides (e.g. QUEST.yaml) are promoted onto the root cfg
 # by process_cfg() in slam/utils/mapping_utils.py.
+#
+# Layer 2 — pre-SAM string match. Right after GDINO produces labeled boxes,
+# drop boxes whose RAM label is in `ignore_classes_strict` AND GDINO
+# confidence > strict_confidence_threshold. Saves SAM + CLIP cost on
+# confidently-tagged humans. Use only for unambiguous tags (person, man,
+# woman, ...) — body-part tags belong in Layer 3 because they double as
+# furniture parts (chair "arm", table "leg").
+skip_ignored_strict: !!bool False
+ignore_classes_strict: []
+strict_confidence_threshold: 0.4
+
+# Layer 3 — post-CLIP semantic drop. For detections whose RAM label is in
+# `ignore_classes_clip` (body-part / ambiguous tags), compute cosine sim
+# between the detection's CLIP image embedding and pre-encoded ignore-class
+# text embeddings. Drop if max sim > ignore_clip_threshold. Class-name gate
+# avoids spuriously CLIP-scoring non-body-part detections. init_clip_ignore_filter
+# wraps each entry as f"a photo of a {c}" before encoding.
+skip_ignored_clip: !!bool False
+ignore_classes_clip: []
+ignore_clip_threshold: 0.28
+
+# Layer 2-late (legacy) — string match inside filter_gobs. Runs post-CLIP
+# in the mapping consumer / non-pipelined path; left in for back-compat.
+# Modern Quest configs use Layer 2 (pre-SAM, strict) instead.
 skip_ignored: !!bool False
 ignore_classes: []
 
-# CLIP-similarity variant of the ignore filter. When True, mapping_server /
-# inference_pipeline encode `ignore_classes` once via the CLIP text encoder
-# at startup (see init_clip_ignore_filter), then per-frame drop any mask
-# whose CLIP image embedding has cosine similarity > ignore_clip_threshold
-# with any ignored-class text embedding. Robust to upstream tagger
-# vocabulary mismatches (e.g. RAM emits "face" not "human face").
-skip_ignored_clip: !!bool False
-ignore_clip_threshold: 0.28
 debug_ignore_drops: !!bool False
 min_points_threshold: 16 # projected and sampled pcd with less points will be skipped
 

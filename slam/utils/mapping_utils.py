@@ -45,11 +45,20 @@ def init_clip_ignore_filter(cfg: DictConfig, experiment_config) -> None:
     """
     if not bool(cfg.get('skip_ignored_clip', False)):
         return
-    classes = list(cfg.get('ignore_classes', []) or [])
-    if not classes:
+    # Prefer the new ignore_classes_clip; fall back to legacy ignore_classes
+    # if some other dataset config still uses that field.
+    bare_classes = list(cfg.get('ignore_classes_clip', []) or [])
+    if not bare_classes:
+        bare_classes = list(cfg.get('ignore_classes', []) or [])
+    if not bare_classes:
         print("[init_clip_ignore_filter] skip_ignored_clip=True but "
-              "ignore_classes is empty; CLIP ignore filter NOT armed.")
+              "ignore_classes_clip is empty; CLIP ignore filter NOT armed.")
         return
+
+    # Wrap each bare tag with the standard CLIP photo template — empirically
+    # this aligns better with how CLIP image encodings sit in embedding space
+    # than bare class names alone.
+    prompts = [f"a photo of a {c}" for c in bare_classes]
 
     # Imported lazily so processes that don't need CLIP-ignore don't pay the
     # open_clip import cost.
@@ -61,11 +70,11 @@ def init_clip_ignore_filter(cfg: DictConfig, experiment_config) -> None:
     threshold = float(cfg.get('ignore_clip_threshold', 0.28))
 
     print(f"[init_clip_ignore_filter] Loading CLIP {clip_name}/{pretrained} on "
-          f"{device} to encode {len(classes)} ignore class(es)...")
+          f"{device} to encode {len(prompts)} ignore prompt(s)...")
     clip_model, _, _ = open_clip.create_model_and_transforms(clip_name, pretrained)
     clip_model = clip_model.to(device).eval()
     tokenizer = open_clip.get_tokenizer(clip_name)
-    tokens = tokenizer(classes).to(device)
+    tokens = tokenizer(prompts).to(device)
     with torch.no_grad():
         text_feats = clip_model.encode_text(tokens).float()
         text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
@@ -76,7 +85,7 @@ def init_clip_ignore_filter(cfg: DictConfig, experiment_config) -> None:
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
     print(f"[init_clip_ignore_filter] CLIP ignore filter armed: "
-          f"{len(classes)} classes, thresh={threshold}, classes={classes}")
+          f"{len(prompts)} prompts, thresh={threshold}, prompts={prompts}")
 
 
 def get_dataset(datasetClass, config_dict, desired_height, desired_width, device, dtype, scene_name=None, test_depth_downsampling=1):
@@ -182,29 +191,45 @@ def process_cfg(cfg: DictConfig, useDetector, datasetClass):
             cfg.mask_conf_threshold = 0.25
             cfg.skip_bg = False
 
-        # Promote dataset-level ignore list (e.g. QUEST.yaml's human classes)
-        # onto the root cfg so filter_gobs() can read it directly.
-        dataset_ignores = list(cfg.dataset_config.get("ignore_classes", []) or [])
-        if dataset_ignores:
-            cfg.ignore_classes = dataset_ignores
-            cfg.skip_ignored = True
-            print(f"[process_cfg] skip_ignored=True, ignore_classes={dataset_ignores}")
+        # Promote three-layer ignore-filter config from dataset_config onto
+        # root cfg so callers downstream (filter_detections_strict pre-SAM,
+        # filter_detections_clip_ignore post-CLIP, filter_gobs in pipelined
+        # path, init_clip_ignore_filter) can read it as cfg.<key>.
 
-        # Promote CLIP-similarity ignore flag + threshold (independent of the
-        # string-match variant). filter_gobs() will use both if both are on.
-        if cfg.dataset_config.get("skip_ignored_clip", False):
+        # Layer 2 (pre-SAM, GDINO-confidence-gated string match)
+        strict_list = list(cfg.dataset_config.get("ignore_classes_strict", []) or [])
+        if strict_list and cfg.dataset_config.get("skip_ignored_strict", False):
+            cfg.ignore_classes_strict = strict_list
+            cfg.skip_ignored_strict = True
+            cfg.strict_confidence_threshold = float(
+                cfg.dataset_config.get("strict_confidence_threshold",
+                                       cfg.get("strict_confidence_threshold", 0.4))
+            )
+            print(f"[process_cfg] skip_ignored_strict=True, "
+                  f"strict_confidence_threshold={cfg.strict_confidence_threshold}, "
+                  f"ignore_classes_strict={strict_list}")
+
+        # Layer 3 (post-CLIP, class-name-gated CLIP-similarity)
+        clip_list = list(cfg.dataset_config.get("ignore_classes_clip", []) or [])
+        if clip_list and cfg.dataset_config.get("skip_ignored_clip", False):
+            cfg.ignore_classes_clip = clip_list
             cfg.skip_ignored_clip = True
             cfg.ignore_clip_threshold = float(
                 cfg.dataset_config.get("ignore_clip_threshold",
                                        cfg.get("ignore_clip_threshold", 0.28))
             )
             print(f"[process_cfg] skip_ignored_clip=True, "
-                  f"ignore_clip_threshold={cfg.ignore_clip_threshold}")
+                  f"ignore_clip_threshold={cfg.ignore_clip_threshold}, "
+                  f"ignore_classes_clip={clip_list}")
 
-        # Promote the debug flag so filter_gobs / filter_detections_clip_ignore
-        # see it on root cfg (they read cfg.get('debug_ignore_drops', False)).
-        # Without this, debug_ignore_drops stays at base.yaml's default (False)
-        # even when QUEST.yaml sets it True — and drops would happen silently.
+        # Legacy single-list string match in filter_gobs (Layer 2-late).
+        legacy_list = list(cfg.dataset_config.get("ignore_classes", []) or [])
+        if legacy_list:
+            cfg.ignore_classes = legacy_list
+            cfg.skip_ignored = True
+            print(f"[process_cfg] (legacy) skip_ignored=True, ignore_classes={legacy_list}")
+
+        # Promote the debug flag (otherwise drops happen silently).
         if cfg.dataset_config.get("debug_ignore_drops", False):
             cfg.debug_ignore_drops = True
             print("[process_cfg] debug_ignore_drops=True")

@@ -42,6 +42,7 @@ from slam.utils.general_utils import to_tensor, to_numpy
 from slam.core.slam_classes import MapObjectList, DetectionList
 from slam.core.utils import (
     filter_detections_clip_ignore,
+    filter_detections_strict,
     merge_obj2_into_obj1,
     filter_objects,
     merge_objects,
@@ -362,6 +363,10 @@ def inference_consumer(inferenceQueue,
             caption_end = time.perf_counter_ns()
             # print("[INFERENCE SERVER]\t\t CLASSES --------------------------------------: ",  captioning_model.classes)
             detections = detection_model.get_detections(image_cv2_bgr, captioning_model.classes)
+            # Layer 2 ignore filter — drop confidently-tagged human boxes
+            # before they hit SAM/CLIP. See filter_detections_strict in
+            # slam/core/utils.py for the rationale.
+            detections = filter_detections_strict(cfg, detections, captioning_model.classes)
             detecttion_end = time.perf_counter_ns()
             # print("[INFERENCE SERVER]\t\tNumber of objects detected: ", len(detections.xyxy))
             mask, _, _ = segmentation_model.run_segmentation(image_rgb, detections)

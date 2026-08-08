@@ -87,29 +87,92 @@ def compute_clip_ignore_drops(img_feats):
     return drop, max_sims.detach().cpu().numpy()
 
 
+def filter_detections_strict(cfg: DictConfig, detections, classes):
+    """Layer 2 — pre-SAM string-match drop on GDINO output.
+
+    Drop detections whose RAM label is in `cfg.ignore_classes_strict` AND
+    GDINO confidence > `cfg.strict_confidence_threshold`. Runs right after
+    GDINO and before SAM/CLIP, so we save SAM + CLIP cost on confidently
+    tagged whole-person detections.
+
+    Confidence gate is the key safety feature: GDINO will sometimes
+    hallucinate a `man` label on a chair-arm at conf 0.21; threshold > 0.4
+    means only confidently-tagged dets are dropped. Borderline cases fall
+    through to Layer 3 (CLIP-similarity), which is visually grounded and
+    won't drop chair-arms.
+
+    `detections` is a supervision.Detections — returned filtered (or
+    unchanged when the layer isn't armed). `classes` is the RAM/captioning
+    class-name list that detections.class_id indexes into.
+    """
+    if not bool(cfg.get('skip_ignored_strict', False)):
+        return detections
+    strict_set = set(cfg.get('ignore_classes_strict', []) or [])
+    if not strict_set or len(detections.xyxy) == 0:
+        return detections
+
+    conf_thresh = float(cfg.get('strict_confidence_threshold', 0.4))
+    keep = np.ones(len(detections.xyxy), dtype=bool)
+    dropped = []
+    for i in range(len(detections.xyxy)):
+        cid = int(detections.class_id[i])
+        cname = classes[cid] if 0 <= cid < len(classes) else None
+        conf = float(detections.confidence[i])
+        if cname in strict_set and conf > conf_thresh:
+            keep[i] = False
+            dropped.append((cname, round(conf, 3)))
+
+    if dropped and bool(cfg.get('debug_ignore_drops', False)):
+        print(f"[strict_ignore] dropped {len(dropped)} detection(s) pre-SAM "
+              f"(conf > {conf_thresh}): {dropped}")
+
+    return detections[keep]
+
+
 def filter_detections_clip_ignore(cfg: DictConfig, fg_detection_list, bg_detection_list):
-    """Drop detections whose CLIP image embedding matches an ignore-class text embedding.
+    """Layer 3 — post-CLIP semantic-similarity drop with class-name gate.
 
-    Counterpart to filter_gobs's CLIP-ignore block for the non-pipelined path:
-    there, filter_gobs runs in a sibling thread before CLIP has completed, so
-    gobs['image_feats'] is None when filter_gobs inspects it and that block is
-    a no-op. By the time this function is called, clip_ft has been attached
-    to each detection — so we can run the same drop logic on each det's
-    already-attached feature.
+    For each detection whose RAM label is in `cfg.ignore_classes_clip` (body
+    parts / ambiguous tags), compute cosine sim between its CLIP image
+    embedding and the pre-encoded ignore-class text embeddings; drop if max
+    sim > threshold. Detections labeled with non-body-part tags (chair, wall,
+    laptop, ...) are NOT scored — avoids the CLIP-noise-floor false positives
+    we saw in earlier debug logs (chair @ sim 0.20 dropped against humans).
 
-    Returns new (fg_detection_list, bg_detection_list) with matching dets
-    removed. Safe to call when the filter is disarmed or empty (returns inputs
-    unchanged). Caller should pass the root cfg (for skip_ignored_clip /
-    debug_ignore_drops flags). Uses compute_clip_ignore_drops() so tuning the
-    threshold in one place affects both paths.
+    The class-name gate is the architectural payoff of splitting the strict
+    list (Layer 2) from the clip list (Layer 3): each layer only sees the
+    detections it can sensibly judge.
+
+    Counterpart to filter_gobs's CLIP block in the pipelined path. Runs after
+    clip_ft is attached to each detection in the non-pipelined inference
+    consumer, before bg fusion / fg association.
     """
     if not bool(cfg.get('skip_ignored_clip', False)):
         return fg_detection_list, bg_detection_list
     if len(fg_detection_list) == 0 and len(bg_detection_list) == 0:
         return fg_detection_list, bg_detection_list
 
+    eligible = set(cfg.get('ignore_classes_clip', []) or [])
+    if not eligible:
+        # Back-compat: if the new list is empty but the legacy single list
+        # is set, fall back to scoring all detections (old behavior).
+        legacy = list(cfg.get('ignore_classes', []) or [])
+        if not legacy:
+            return fg_detection_list, bg_detection_list
+
     all_dets = list(fg_detection_list) + list(bg_detection_list)
-    clip_fts = [obj.get('clip_ft') for obj in all_dets]
+
+    def _is_eligible(obj):
+        if not eligible:                 # legacy fallback path
+            return True
+        cname = obj.get('class_name', [None])[0]
+        return cname in eligible
+
+    eligible_idx = [i for i, obj in enumerate(all_dets) if _is_eligible(obj)]
+    if not eligible_idx:
+        return fg_detection_list, bg_detection_list
+
+    clip_fts = [all_dets[i].get('clip_ft') for i in eligible_idx]
     if not all(ft is not None for ft in clip_fts):
         return fg_detection_list, bg_detection_list
 
@@ -118,16 +181,23 @@ def filter_detections_clip_ignore(cfg: DictConfig, fg_detection_list, bg_detecti
     if drop is None or not drop.any():
         return fg_detection_list, bg_detection_list
 
+    # Map drops from eligible-space back to all_dets-space
+    full_drop = np.zeros(len(all_dets), dtype=bool)
+    for j, i in enumerate(eligible_idx):
+        if drop[j]:
+            full_drop[i] = True
+
     n_fg = len(fg_detection_list)
-    fg_keep = [i for i in range(n_fg) if not drop[i]]
-    bg_keep = [i for i in range(len(bg_detection_list)) if not drop[n_fg + i]]
+    fg_keep = [i for i in range(n_fg) if not full_drop[i]]
+    bg_keep = [i for i in range(len(bg_detection_list)) if not full_drop[n_fg + i]]
 
     if bool(cfg.get('debug_ignore_drops', False)):
         dropped_info = [
-            (all_dets[i].get('class_name', ['?'])[0], round(float(sims[i]), 3))
-            for i in range(len(drop)) if drop[i]
+            (all_dets[eligible_idx[j]].get('class_name', ['?'])[0], round(float(sims[j]), 3))
+            for j in range(len(drop)) if drop[j]
         ]
-        print(f"[clip_ignore] dropped {int(drop.sum())} detection(s): {dropped_info}")
+        print(f"[clip_ignore] dropped {int(full_drop.sum())} detection(s) "
+              f"(of {len(eligible_idx)} eligible / {len(all_dets)} total): {dropped_info}")
 
     return (
         DetectionList([fg_detection_list[i] for i in fg_keep]),
@@ -648,26 +718,45 @@ def filter_gobs(
     skip_ignored = bool(cfg.get('skip_ignored', False))
     ignore_classes = set(cfg.get('ignore_classes', []) or []) if skip_ignored else set()
 
-    # Ignore filter (CLIP-similarity variant): drop masks whose CLIP image
-    # embedding is close to any pre-encoded ignore-class text embedding.
-    # Only fires when gobs arrives here with image_feats populated (pipelined
-    # mapping path — inference.py stashes feats into gobs before sending to
-    # the mapping queue). In the non-pipelined path (inference_pipeline.py),
-    # filter_gobs runs in parallel with CLIP so image_feats is None here;
-    # that path applies the CLIP-ignore filter post-hoc on each detection's
-    # clip_ft AFTER attachment — see inference_consumer().
+    # Layer 3 — CLIP-similarity drop with class-name gate. Only fires for
+    # masks whose RAM label is in cfg.ignore_classes_clip; chairs/walls/
+    # laptops are not scored, so the CLIP noise floor can't drop them.
+    # Only active in the pipelined mapping path where gobs['image_feats']
+    # is populated by inference.py. Non-pipelined path uses the parallel
+    # filter_detections_clip_ignore() in inference_pipeline.
     clip_drop_mask = None
     if bool(cfg.get('skip_ignored_clip', False)):
-        clip_drop_mask, max_sims_np = compute_clip_ignore_drops(gobs.get('image_feats'))
-        if clip_drop_mask is not None and clip_drop_mask.any() and bool(cfg.get('debug_ignore_drops', False)):
-            dropped_labels = [
-                gobs['classes'][gobs['class_id'][i]]
-                for i in range(len(clip_drop_mask)) if clip_drop_mask[i]
-            ]
-            dropped_sims = [round(float(max_sims_np[i]), 3)
-                            for i in range(len(clip_drop_mask)) if clip_drop_mask[i]]
-            print(f"[filter_gobs] CLIP-ignored {int(clip_drop_mask.sum())} mask(s): "
-                  f"labels={dropped_labels} max_sims={dropped_sims}")
+        eligible = set(cfg.get('ignore_classes_clip', []) or [])
+        if not eligible:
+            # Back-compat: legacy ignore_classes scored everything
+            legacy = list(cfg.get('ignore_classes', []) or [])
+            score_all = bool(legacy)
+        else:
+            score_all = False
+
+        eligible_mask = np.array(
+            [
+                (gobs['classes'][gobs['class_id'][i]] in eligible) if not score_all else True
+                for i in range(len(gobs['xyxy']))
+            ],
+            dtype=bool,
+        )
+        if eligible_mask.any():
+            img_feats = gobs.get('image_feats')
+            if img_feats is not None and len(img_feats) == len(eligible_mask):
+                eligible_feats = img_feats[eligible_mask]
+                drop_eligible, sims_eligible = compute_clip_ignore_drops(eligible_feats)
+                if drop_eligible is not None:
+                    clip_drop_mask = np.zeros(len(eligible_mask), dtype=bool)
+                    e_idx = np.where(eligible_mask)[0]
+                    clip_drop_mask[e_idx] = drop_eligible
+                    if clip_drop_mask.any() and bool(cfg.get('debug_ignore_drops', False)):
+                        dropped = [
+                            (gobs['classes'][gobs['class_id'][int(e_idx[j])]], round(float(sims_eligible[j]), 3))
+                            for j in range(len(drop_eligible)) if drop_eligible[j]
+                        ]
+                        print(f"[filter_gobs] CLIP-ignored {int(clip_drop_mask.sum())} mask(s) "
+                              f"(of {int(eligible_mask.sum())} eligible / {len(eligible_mask)} total): {dropped}")
 
     # Filter out the objects based on various criteria
     idx_to_keep = []

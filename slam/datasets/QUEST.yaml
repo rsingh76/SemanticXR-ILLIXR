@@ -1,39 +1,60 @@
 dataset_name: 'quest'
 
-# CLIP-similarity ignore filter (preferred). When True, the mapping consumer
-# encodes ignore_classes via the CLIP text encoder once at startup, then
-# drops any mask whose CLIP image embedding cosine-sim > threshold with any
-# ignored-class text embedding. Independent of the string-match path below
-# (skip_ignored is auto-enabled by process_cfg whenever ignore_classes is
-# non-empty). CLIP-similarity is robust to RAM's vocabulary, so "human face"
-# below activates on actual human faces even though RAM tags as "face".
+# === Three-layer human-ignore filter for SemanticXR ===
+# See slam/datasets/base.yaml for the full design notes. Both layers are
+# independently togglable. Pre-SAM (strict) drops confidently-tagged whole-
+# person detections cheaply; post-CLIP drops body parts only after a visual
+# semantic check (so chair "arm" / table "leg" / bottle "neck" survive).
+debug_ignore_drops: !!bool True
+
+# Layer 2 — pre-SAM, GDINO-confidence-gated. Bare RAM tags only; tags
+# RAM unambiguously associates with whole humans. Threshold lowered from
+# 0.4 to 0.30 (just above GDINO's box_threshold 0.2) after seeing
+# dataset_0/1 leak persons at conf 0.20-0.40 past the 0.4 gate.
+skip_ignored_strict: !!bool True
+strict_confidence_threshold: 0.30
+ignore_classes_strict:
+  - person
+  - man
+  - woman
+  - boy
+  - girl
+  - child
+  - baby
+  - kid
+
+# Layer 3 — post-CLIP, class-name-gated. Includes BOTH whole-person tags
+# (belt-and-suspenders for low-confidence person detections that slip past
+# Layer 2) AND body-part tags. Only detections whose RAM label is in this
+# list are CLIP-scored. init_clip_ignore_filter wraps each as
+# "a photo of a {c}". CLIP-sim being a visual gate means we get to
+# include 'person'/'woman' here without false-positive risk on chairs.
 skip_ignored_clip: !!bool False
-ignore_clip_threshold: 0.24      # tunable; log per-drop sims via debug_ignore_drops
-debug_ignore_drops: !!bool True  # flip True for first few sessions to dial in threshold
+ignore_clip_threshold: 0.25
+ignore_classes_clip:
+  - person
+  - man
+  - woman
+  - boy
+  - girl
+  - child
+  - baby
+  - kid
+  - face
+  - head
+  - hair
+  - hand
+  - finger
+  - arm
+  - leg
+  - foot
+  - toe
+  - knee
+  - shoulder
+  - neck
+  - torso
+
 downsample_voxel_size: 0.02
-# Ignore-list for SemanticXR on Quest: any mask whose class name matches one
-# of these is dropped before mapping (see filter_gobs in slam/core/utils.py).
-# Promoted onto the root cfg by process_cfg() in slam/utils/mapping_utils.py,
-# which flips cfg.skip_ignored to True when this list is non-empty.
-ignore_classes:
-  - a photo of a person
-  - a photo of a people
-  - a photo of a human
-  - a photo of a man
-  - a photo of a woman
-  - a photo of a boy
-  - a photo of a girl
-  - a photo of a child
-  - a photo of a human face
-  - a photo of a human body
-  - a photo of a human hand
-  - a photo of a human head
-  - a photo of a human leg
-  # - a photo of a human arm
-  # - a photo of a human foot
-  # - a photo of a human body
-  # - a photo of a human torso
-  # - a photo of a human shoulder
 
 mapping:
   every_frame: 5
