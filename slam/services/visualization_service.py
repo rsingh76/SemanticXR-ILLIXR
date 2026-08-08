@@ -81,8 +81,8 @@ class VisualizationServicer(vis_pb2_grpc.VisualizerServerServicer):
         self.grpc_server = grpc_server  # Store server reference for shutdown
 
         
-        # self.log_directory = "/home/rahul/Documents/connor_streaming_code/new_clean_repo/main/semantic_slam_server/timing_info/streaming/clientUpdateMode/"   
-        # self.queryLog_directory = "/home/rahul/Documents/connor_streaming_code/new_clean_repo/main/semantic_slam_server/timing_info/server_query_logs/clientUpdateMode/"
+        # self.log_directory = "<path>/timing_info/streaming/clientUpdateMode/"   
+        # self.queryLog_directory = "<path>/timing_info/server_query_logs/clientUpdateMode/"
         
         # Initialize centralized performance manager with proper scene name
         import os
@@ -399,7 +399,7 @@ class VisualizationServicer(vis_pb2_grpc.VisualizerServerServicer):
     #     self.class_names = results['class_names']
         
         
-    #     # resultPath = "/home/rahul/Documents/scene_graphs/concept-graphs/external/nice-slam/scripts/Datasets/Replica/dataset_2/pcd_saves/full_pcd_none_overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub_post.pkl.gz"
+    #     # resultPath = "<path>/pcd_saves/full_pcd_none_overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub_post.pkl.gz"
         
     #     # self.pcds = copy.deepcopy(self.objects.get_values("pcd"))
     #     self.pcds = self.objects.get_values("pcd")
@@ -673,7 +673,7 @@ class VisualizationServicer(vis_pb2_grpc.VisualizerServerServicer):
             # self.class_names = results['class_names']
             
             
-            # resultPath = "/home/rahul/Documents/scene_graphs/concept-graphs/external/nice-slam/scripts/Datasets/Replica/dataset_2/pcd_saves/full_pcd_none_overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub_post.pkl.gz"
+            # resultPath = "<path>/pcd_saves/full_pcd_none_overlap_maskconf0.95_simsum1.2_dbscan.1_merge20_masksub_post.pkl.gz"
             
             # self.pcds = copy.deepcopy(self.objects.get_values("pcd"))
             # self.pcds = self.objects.get_values("pcd")
@@ -717,7 +717,115 @@ def _set_pdeathsig_on_linux():
         pass
 
 
-def vis_server(visualizationQueue, config, dataset_type, clientUpdateMode=False, client_update_frameInt=1, clientIP=None, args=None):
+class _FakeUpdateMapContext:
+    """Stand-in for a gRPC servicer context so ``updateMap`` runs UNMODIFIED in
+    ILLIXR mode. ``updateMap`` only calls ``context.is_active()``; liveness here
+    is driven solely by the servicer's ``_shutdown_event`` (set on the in-band
+    ``shutdown`` dict or on SIGTERM)."""
+
+    def is_active(self):
+        return True
+
+
+def _answer_illixr_voice_query(servicer, q, respQ):
+    """Answer one ILLIXR voice_query by reusing the SAME engine as the gRPC
+    ``clientTextQuery``: ASR -> ``getClipComparison`` -> emit a query_response
+    dict on ``respQ`` (drained by the relay into illixr_response_writer.put).
+    """
+    import numpy as np
+
+    query_id = int(q.get('query_id', 0))
+    pcm = q['pcm_data']
+    pcm_bytes = pcm.tobytes() if hasattr(pcm, 'tobytes') else bytes(pcm)
+
+    if not servicer.asr.enabled:
+        print("⚠️  [VISUALIZATION] ASR disabled; cannot answer voice query")
+        respQ.put({"query_id": query_id, "point_clouds": [], "colors": [],
+                   "server_latency": 0.0, "text_query": ""})
+        return
+
+    # ASR over the full PCM payload (single chunk). Same call clientTextQuery uses.
+    text_query, asr_ms = servicer.asr.transcribe_chunks(iter([pcm_bytes]))
+    print(f"Transcript: {text_query}  ({asr_ms:.1f} ms)")
+
+    # voice_query defaults thresholds to 0.0 when unset; treat 0.0 as "unset"
+    # so _resolve_threshold falls back to the server default (not a literal 0).
+    sim_in = q.get('similarity_threshold') or None
+    floor_in = q.get('min_match_similarity') or None
+    sim_thr, _ = servicer._resolve_threshold(sim_in, servicer.similarity_threshold, "similarity_threshold")
+    min_match, _ = servicer._resolve_threshold(floor_in, servicer.min_match_similarity, "min_match_similarity")
+
+    if servicer.pcd_points is None:
+        respQ.put({"query_id": query_id, "point_clouds": [], "colors": [],
+                   "server_latency": 0.0, "text_query": text_query})
+        return
+
+    servicer.query_index += 1
+    print(f"\n[VISUALIZATION SERVER]\t\t looking for ----- {text_query} "
+          f"| sim={sim_thr:.3f} min_match={min_match:.3f}")
+    start = time.perf_counter_ns()
+    pcd_list, color_list = servicer.getClipComparison(
+        text_query, similarity_threshold=sim_thr, min_match_similarity=min_match,
+    )
+    latency_s = (time.perf_counter_ns() - start) / 1e9
+
+    # Build the query_response payload (matches py_query_response_writer.put).
+    # createGRPCResponse hardcodes centroid [0,0,0]; here we compute the real
+    # centroid (SEMANTICXR_ILLIXR_INTEGRATION.md §1b fix) since the client uses it.
+    point_clouds = []
+    per_cloud_counts = []
+    for pcd in pcd_list:
+        pts = np.asarray(pcd).reshape(-1, 3)
+        centroid = pts.mean(axis=0).tolist() if pts.size else [0.0, 0.0, 0.0]
+        point_clouds.append({"points": pts.reshape(-1).tolist(), "centroid": centroid})
+        per_cloud_counts.append(int(pts.shape[0]))
+
+    total_pts = sum(per_cloud_counts)
+    print(f"📦 [VISUALIZATION] query '{text_query}' -> {len(point_clouds)} cloud(s), "
+          f"{total_pts} points total, per-cloud={per_cloud_counts}, colors={len(color_list)}")
+
+    respQ.put({
+        "query_id": query_id,
+        "point_clouds": point_clouds,
+        "colors": list(color_list),
+        "server_latency": latency_s,
+        "text_query": text_query,
+    })
+    servicer.log_query_info({'query_num': servicer.query_index,
+                             'time_to_get_point_clouds': latency_s * 1e3,
+                             'num_objects': len(servicer.pcd_points)})
+
+
+def _run_illixr_vis(servicer, voiceQ, respQ):
+    """ILLIXR egress driver. Map state is maintained by the existing
+    ``updateMap`` drain loop (run verbatim in a thread); voice queries are
+    answered from ``voiceQ`` and written to ``respQ``. No gRPC."""
+    import queue as _queue
+    import threading
+
+    map_thread = threading.Thread(
+        target=servicer.updateMap, args=(None, _FakeUpdateMapContext()),
+        name="illixr_map_drain", daemon=True,
+    )
+    map_thread.start()
+    print("🗺️  [VISUALIZATION] ILLIXR map-drain thread started (reusing updateMap)")
+
+    while not servicer._shutdown_event.is_set():
+        try:
+            q = voiceQ.get(timeout=1.0)
+        except _queue.Empty:
+            continue
+        if isinstance(q, dict) and q.get('type') == 'shutdown':
+            servicer._shutdown_event.set()
+            break
+        try:
+            _answer_illixr_voice_query(servicer, q, respQ)
+        except Exception as e:
+            print(f"❌ [VISUALIZATION] voice query failed: {e}")
+    print("🏁 [VISUALIZATION] ILLIXR query loop exiting")
+
+
+def vis_server(visualizationQueue, config, dataset_type, clientUpdateMode=False, client_update_frameInt=1, clientIP=None, args=None, voiceQ=None, respQ=None):
     _set_pdeathsig_on_linux()
     # Extract visualization config values
     if config is None:
@@ -735,17 +843,24 @@ def vis_server(visualizationQueue, config, dataset_type, clientUpdateMode=False,
     precision = config.model.visualization.precision
     batch_size = config.model.visualization.batch_size
 
+    # ILLIXR mode: queues replace gRPC. No server is created; the servicer's
+    # query engine + updateMap drain loop are reused as-is.
+    illixr_mode = voiceQ is not None and respQ is not None
+
     # Create a gRPC server. ``grpc.so_reuseport=0`` disables SO_REUSEPORT so
     # the bind fails LOUDLY if a previous viz process is still sitting on the
     # port — instead of silently letting a zombie shadow us (symptom: every
     # frame gets dropped because inference's wake-up RPC lands on the zombie).
     port = 50054
-    server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=2),
-        options=[('grpc.so_reuseport', 0)],
-    )
+    server = None
+    if not illixr_mode:
+        server = grpc.server(
+            futures.ThreadPoolExecutor(max_workers=2),
+            options=[('grpc.so_reuseport', 0)],
+        )
 
-    # Create servicer with server reference for graceful shutdown
+    # Create servicer with server reference for graceful shutdown (None in ILLIXR
+    # mode — updateMap's shutdown branch already guards `if self.grpc_server:`).
     servicer = VisualizationServicer(visualizationQueue,
                                    device,
                                    dataset_type=dataset_type,
@@ -762,17 +877,24 @@ def vis_server(visualizationQueue, config, dataset_type, clientUpdateMode=False,
 
     # OS-signal-driven shutdown: on SIGTERM / SIGINT, flip the servicer's
     # shutdown flag and stop the gRPC server. The updateMap drain loop
-    # polls the flag every second and returns on the next tick.
+    # polls the flag every second and returns on the next tick. (Valid in both
+    # modes — viz is a spawned child, so this is its main thread.)
     import signal as _signal
     def _shutdown(signum, frame):
         print(f"⚠️  [VISUALIZATION] Signal {signum} received — shutting down")
         servicer._shutdown_event.set()
-        try:
-            server.stop(grace=2.0)
-        except Exception as e:
-            print(f"[VISUALIZATION] server.stop() error: {e}")
+        if server is not None:
+            try:
+                server.stop(grace=2.0)
+            except Exception as e:
+                print(f"[VISUALIZATION] server.stop() error: {e}")
     _signal.signal(_signal.SIGTERM, _shutdown)
     _signal.signal(_signal.SIGINT, _shutdown)
+
+    if illixr_mode:
+        print("*****************************************************[Visualization Server: ILLIXR switchboard mode (no gRPC)]*****************************************************")
+        _run_illixr_vis(servicer, voiceQ, respQ)
+        return
 
     vis_pb2_grpc.add_VisualizerServerServicer_to_server(servicer, server)
     try:

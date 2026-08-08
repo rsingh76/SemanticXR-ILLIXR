@@ -123,7 +123,12 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
     # Wake viz's drain loop before frames start flowing — same handshake as
     # the non-pipelined path uses in inference_pipeline.py. The wake function
     # owns its own channel + daemon thread so we don't keep one in this scope.
-    _wake_viz_consumer()
+    # ILLIXR relay mode: viz has no gRPC server (drain loop started by the
+    # relay), so skip the wake RPC (it would block 120s then time out).
+    if os.environ.get('ILLIXR_RELAY') == '1':
+        print("ℹ️  [MAPPING] ILLIXR relay mode: skipping viz wake RPC (drain loop started by relay)")
+    else:
+        _wake_viz_consumer()
 
     # Frame-timing logs live here (mirrors inference_pipeline.py:246) so every
     # processed frame is captured, not just ones that fit in the viz queue.

@@ -242,7 +242,14 @@ def inference_consumer(inferenceQueue,
     # doesn't return (it's a forever drain loop), so awaiting it would deadlock
     # the inference loop. Running it as fire-and-forget also avoids a race where
     # a fast producer drops every frame before viz is ever called.
-    _wake_viz_consumer()
+    #
+    # ILLIXR relay mode: viz runs no gRPC server (its drain loop is started
+    # directly by _run_illixr_vis), so the wake RPC has nothing to connect to and
+    # would block 120s on channel-ready before timing out. Skip it.
+    if os.environ.get('ILLIXR_RELAY') == '1':
+        print("ℹ️  [INFERENCE] ILLIXR relay mode: skipping viz wake RPC (drain loop started by relay)")
+    else:
+        _wake_viz_consumer()
 
     skipped_frames = 0
     # Frame-timing logs live in this process so they capture every processed
@@ -255,6 +262,9 @@ def inference_consumer(inferenceQueue,
     # Sentinel ``object()`` ≠ any ``Optional[float]``.
     _UNSET_CAP = object()
     session_max_depth_m = _UNSET_CAP
+    # Lazily-built converter for the ILLIXR relay path (raw semantic_data dicts).
+    # None in the gRPC path, which enqueues ready-made 9-tuples.
+    illixr_converter = None
     print("*****************************************************[Mapping Consumer Started]*****************************************************")
     print("Configuration:")
     print(f"[MAPPING SERVER] useDetector: {useDetector}")
@@ -329,6 +339,18 @@ def inference_consumer(inferenceQueue,
             _forward_signal_nonblocking(visualizationQueue, queue_item, "shutdown")
             break
             
+        # ILLIXR relay path: a raw semantic_data dict (has 'image') arrives instead
+        # of a 9-tuple. Decode/reproject HERE (in the worker) so the relay stays
+        # lean and the big decoded arrays never cross the mp.Queue. The gRPC path
+        # already enqueues 9-tuples (tuples), which fall straight through.
+        if isinstance(queue_item, dict) and 'image' in queue_item:
+            if illixr_converter is None:
+                from server.illixr_ingress import IllixrFrameConverter
+                illixr_converter = IllixrFrameConverter(config)
+            queue_item = illixr_converter.convert(queue_item)
+            if queue_item is None:
+                continue  # decode / size-mismatch failure -> drop frame
+
         # 9-slot tuple: slot 9 is the per-frame client wire stamp
         # (Optional[float]; None = "client didn't specify"). See
         # server/components/inference_service.py::submit_inference_request.

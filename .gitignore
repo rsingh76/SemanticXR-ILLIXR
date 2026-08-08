@@ -39,3 +39,8 @@ server/xr_service_pb2_grpc.py
 
 # Generated visualization images (scripts/visualize_e2e.py)
 outputs/
+
+live_output/
+output/
+slam/services/output_audio.wav
+*.wav
