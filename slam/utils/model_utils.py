@@ -14,9 +14,10 @@ def get_sam_predictor(cfg) -> SamPredictor:
     if cfg.sam_variant == "sam":
         sam = sam_model_registry[cfg.sam_encoder_version](checkpoint=cfg.sam_checkpoint_path)
         sam.to(cfg.device)
+        sam.eval()
         sam_predictor = SamPredictor(sam)
         return sam_predictor
-    
+
     if cfg.sam_variant == "mobilesam":
         from MobileSAM.setup_mobile_sam import setup_model
         # MOBILE_SAM_CHECKPOINT_PATH = os.path.join(GSA_PATH, "./EfficientSAM/mobile_sam.pt")
@@ -25,7 +26,8 @@ def get_sam_predictor(cfg) -> SamPredictor:
         mobile_sam = setup_model()
         mobile_sam.load_state_dict(checkpoint, strict=True)
         mobile_sam.to(device=cfg.device)
-        
+        mobile_sam.eval()
+
         sam_predictor = SamPredictor(mobile_sam)
         return sam_predictor
 
@@ -39,7 +41,8 @@ def get_sam_predictor(cfg) -> SamPredictor:
         light_hqsam = setup_model()
         light_hqsam.load_state_dict(checkpoint, strict=True)
         light_hqsam.to(device=cfg.device)
-        
+        light_hqsam.eval()
+
         sam_predictor = SamPredictor(light_hqsam)
         return sam_predictor
         

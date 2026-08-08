@@ -133,6 +133,7 @@ class VisualizationServicer(vis_pb2_grpc.VisualizerServerServicer):
         else:
             clip_model, _, clip_preprocess = open_clip.create_model_and_transforms(self.clipModelType, self.training_data)
             self.clip_model = clip_model.to(self.device)
+            self.clip_model.eval()
             self.clip_tokenizer = open_clip.get_tokenizer(self.clipModelType)
         print("Done initializing CLIP model.")
         wav_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output_audio.wav")
@@ -243,57 +244,58 @@ class VisualizationServicer(vis_pb2_grpc.VisualizerServerServicer):
         color_to_return = []
         text_queries = [text_query]
         start = time.perf_counter_ns()
-        if self.trt_clip:
-            # print("[[VISUALIZATION SERVER]]****************Using TRT for CLIP]]****************]]****************]]****************]]****************]]****************]]****************")
-            text_query_ft = self.clip_model.encode_text(text_queries)
-            text_query_ft = torch.tensor(text_query_ft.squeeze(), device=self.device)
-        else:
-            text_queries_tokenized = self.clip_tokenizer(text_queries).to(self.device)
-            text_query_ft = self.clip_model.encode_text(text_queries_tokenized)
-            text_query_ft = text_query_ft / text_query_ft.norm(dim=-1, keepdim=True)
-            text_query_ft = text_query_ft.squeeze()
-        clip_time = time.perf_counter_ns() 
-        # print("[VISUALIZATION SERVER]++++++++++++++  Time taken to get text features: ", (clip_time-start)/1e6, "ms", "using TRT: " , self.trt_clip)
-        text_query_ft.unsqueeze(0)
-        
-        # similarities = objects.compute_similarities(text_query_ft)
-        # objects_clip_fts = objects.get_stacked_values_torch("clip_ft")
-        
-        similarities = F.cosine_similarity(
-            text_query_ft.unsqueeze(0), self.objects_clip_fts, dim=-1
-        )
-        max_value = similarities.max()
-        if max_value < min_match:
-            # Floor is model-dependent (MobileCLIP ~0.15, OrigCLIP ~0.20); set per-config
-            # under model.visualization.min_match_similarity. No good matches → empty list.
-            # Can't rely solely on normalized similarities, since it always returns 1 for at least one object.
-            # This can be relaxed - start from max - check if diff(max-2nd max) is > 0.3, if yes, then return the max object
-            # if diff is less than 0.1, then there are similar objects, but we are not sure (since the val is < 0.3). so check if there is a gap of 0.3 between first 1/4th objects.
-            # if yes, then return the first k objects out of 1/4th objects. If not, then return empty list.
-            print("No good matches found --- Max similarity:---------- ", max_value , " for ", text_query)
+        with torch.no_grad():
+            if self.trt_clip:
+                # print("[[VISUALIZATION SERVER]]****************Using TRT for CLIP]]****************]]****************]]****************]]****************]]****************]]****************")
+                text_query_ft = self.clip_model.encode_text(text_queries)
+                text_query_ft = torch.tensor(text_query_ft.squeeze(), device=self.device)
+            else:
+                text_queries_tokenized = self.clip_tokenizer(text_queries).to(self.device)
+                text_query_ft = self.clip_model.encode_text(text_queries_tokenized)
+                text_query_ft = text_query_ft / text_query_ft.norm(dim=-1, keepdim=True)
+                text_query_ft = text_query_ft.squeeze()
+            clip_time = time.perf_counter_ns()
+            # print("[VISUALIZATION SERVER]++++++++++++++  Time taken to get text features: ", (clip_time-start)/1e6, "ms", "using TRT: " , self.trt_clip)
+            text_query_ft.unsqueeze(0)
+
+            # similarities = objects.compute_similarities(text_query_ft)
+            # objects_clip_fts = objects.get_stacked_values_torch("clip_ft")
+
+            similarities = F.cosine_similarity(
+                text_query_ft.unsqueeze(0), self.objects_clip_fts, dim=-1
+            )
+            max_value = similarities.max()
+            if max_value < min_match:
+                # Floor is model-dependent (MobileCLIP ~0.15, OrigCLIP ~0.20); set per-config
+                # under model.visualization.min_match_similarity. No good matches → empty list.
+                # Can't rely solely on normalized similarities, since it always returns 1 for at least one object.
+                # This can be relaxed - start from max - check if diff(max-2nd max) is > 0.3, if yes, then return the max object
+                # if diff is less than 0.1, then there are similar objects, but we are not sure (since the val is < 0.3). so check if there is a gap of 0.3 between first 1/4th objects.
+                # if yes, then return the first k objects out of 1/4th objects. If not, then return empty list.
+                print("No good matches found --- Max similarity:---------- ", max_value , " for ", text_query)
+                return pcd_to_return, color_to_return
+            min_value = similarities.min()
+            print("[VISUALIZATION SERVER]*********** ***********Text:",text_query ," Max similarity: ", max_value, " Min similarity: ", min_value)
+            # normalized_similarities - ranges between 0 and 1. 0 is the least similar, 1 is the most similar. Threshold at 0.86 or 0.87
+            normalized_similarities = (similarities - min_value) / (max_value - min_value)
+            color_sim = (similarities - min_value) / (self.color_ramp_cap - min_value)
+            similarity_colors = self.cmap(color_sim.detach().cpu().numpy())[..., :3]
+            # Find the indices of pcds with similarity greater than the threshold
+            # Two-gate filter: relative cut (top of normalized range) AND absolute
+            # cut (raw similarity above the model-dependent floor). The relative
+            # gate alone leaks objects whose raw similarity is below `min_match`
+            # because min-max normalization always pushes the max to 1.0.
+            indices = torch.where(
+                (normalized_similarities > sim_thr) & (similarities > min_match)
+            )[0].cpu().numpy()
+
+            for i in indices:
+                # self.pcd_points is pre-voxel-downsampled at receive time in updateMap.
+                pcd_to_return.append(self.pcd_points[i])
+                color_to_return.append(similarity_colors[i][0])
+                color_to_return.append(similarity_colors[i][1])
+                color_to_return.append(similarity_colors[i][2])
             return pcd_to_return, color_to_return
-        min_value = similarities.min()
-        print("[VISUALIZATION SERVER]*********** ***********Text:",text_query ," Max similarity: ", max_value, " Min similarity: ", min_value)
-        # normalized_similarities - ranges between 0 and 1. 0 is the least similar, 1 is the most similar. Threshold at 0.86 or 0.87
-        normalized_similarities = (similarities - min_value) / (max_value - min_value)
-        color_sim = (similarities - min_value) / (self.color_ramp_cap - min_value)
-        similarity_colors = self.cmap(color_sim.detach().cpu().numpy())[..., :3]
-        # Find the indices of pcds with similarity greater than the threshold
-        # Two-gate filter: relative cut (top of normalized range) AND absolute
-        # cut (raw similarity above the model-dependent floor). The relative
-        # gate alone leaks objects whose raw similarity is below `min_match`
-        # because min-max normalization always pushes the max to 1.0.
-        indices = torch.where(
-            (normalized_similarities > sim_thr) & (similarities > min_match)
-        )[0].cpu().numpy()
-        
-        for i in indices:
-            # self.pcd_points is pre-voxel-downsampled at receive time in updateMap.
-            pcd_to_return.append(self.pcd_points[i])
-            color_to_return.append(similarity_colors[i][0])
-            color_to_return.append(similarity_colors[i][1])
-            color_to_return.append(similarity_colors[i][2])
-        return pcd_to_return, color_to_return
             
         # print("Number of objects with similarity greater than threshold: ", len(indices))
         # print(indices)

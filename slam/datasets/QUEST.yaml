@@ -78,8 +78,9 @@ merge_text_sim_thresh: 0.8
 #   * streaming mode: overwritten from streaming_defaults below (see
 #     QuestDataset.__init__ and the streaming handoff in grpc_server.py).
 camera_params:
-  image_height: 1280            # processing-target resolution (tunable)
-  image_width: 1280             # processing-target resolution (tunable)
+  # Empirically, sweet spot between 1280x1280 and halving the resolution in both axes
+  image_height: 960            # processing-target resolution (tunable only on the server)
+  image_width: 960             # processing-target resolution (tunable only on the server)
   fx: 0.0
   fy: 0.0
   cx: 0.0

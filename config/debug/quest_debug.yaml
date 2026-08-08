@@ -37,7 +37,7 @@ server:
   target_fps: 2.0
   gpu_id: 0
 
-  inference_queue_size: 2
+  inference_queue_size: 5
   mapping_queue_size: 5
   visualization_queue_size: 2
 
@@ -52,7 +52,7 @@ video:
   temp_output_dir: "./main_server/temp_output_dir"
 
 dataset:
-  enabled: true                        # <-- Dump incoming frames to disk
+  enabled: false                        # <-- Dump incoming frames to disk
   auto_increment_dirs: true
   save_images: true
   save_depth: true
@@ -118,8 +118,10 @@ model:
 
   visualization:
     device: "cuda:0"
+    # similarity_threshold: 0.95    # iHotel Demo values
+    # min_match_similarity: 0.25    # iHotel Demo values
     similarity_threshold: 0.86
-    min_match_similarity: 0.20       # OrigCLIP floor below which getClipComparison returns empty
+    min_match_similarity: 0.22       # OrigCLIP floor below which getClipComparison returns empty
     color_ramp_cap: 0.35             # sim value that saturates the colormap
     colormap: "RdYlGn_wide"          # custom 7-stop red→green (registered in visualization_service); alternatives: "turbo", "RdYlGn", "Spectral"
     clip_model: "ViT-H-14"
@@ -149,7 +151,7 @@ paths:
   temp_output_dir: null
 
 debug:
-  dump_inference: true                      # write per-frame pkl.gz of detections/masks/CLIP
+  dump_inference: false                      # write per-frame pkl.gz of detections/masks/CLIP
   dump_inference_skip_mapping: false        # keep the map running alongside the dumps
   current_scene: null                       # auto-detected
   config_name: "quest_debug"

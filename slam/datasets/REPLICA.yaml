@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 
 dataset_name: 'replica'
+downsample_voxel_size: 0.03
 meshing:
   eval_rec: True
 tracking:

@@ -90,6 +90,7 @@ class SegmentationModel():
     def get_sam_mask_generator(self):
         sam = sam_model_registry[SAM_ENCODER_VERSION](checkpoint=SAM_CHECKPOINT_PATH)
         sam.to(self.device)
+        sam.eval()
         mask_generator = SamAutomaticMaskGenerator(
             model=sam,
             points_per_side=12,
@@ -106,9 +107,10 @@ class SegmentationModel():
         if self.sam_variant == "sam":
             sam = sam_model_registry[SAM_ENCODER_VERSION](checkpoint=SAM_CHECKPOINT_PATH)
             sam.to(self.device)
+            sam.eval()
             sam_predictor = SamPredictor(sam)
             return sam_predictor
-        
+
         if self.sam_variant == "mobilesam":
             from MobileSAM.setup_mobile_sam import setup_model
             MOBILE_SAM_CHECKPOINT_PATH = str(config.mobile_sam_checkpoint_path)
@@ -116,7 +118,8 @@ class SegmentationModel():
             mobile_sam = setup_model()
             mobile_sam.load_state_dict(checkpoint, strict=True)
             mobile_sam.to(device=self.device)
-            
+            mobile_sam.eval()
+
             sam_predictor = SamPredictor(mobile_sam)
             return sam_predictor
 
@@ -127,7 +130,8 @@ class SegmentationModel():
             light_hqsam = setup_model()
             light_hqsam.load_state_dict(checkpoint, strict=True)
             light_hqsam.to(device=self.device)
-            
+            light_hqsam.eval()
+
             sam_predictor = SamPredictor(light_hqsam)
             return sam_predictor
             

@@ -30,10 +30,10 @@ server:
   host: "localhost"
   port: 50051
   max_workers: 4
-  target_fps: 2.0
+  target_fps: 3.0
   gpu_id: 0
 
-  inference_queue_size: 2
+  inference_queue_size: 5
   mapping_queue_size: 5
   visualization_queue_size: 2
 
@@ -48,7 +48,7 @@ video:
   temp_output_dir: "./main_server/temp_output_dir"
 
 dataset:
-  enabled: false                        # <-- Flip to true to dump incoming frames
+  enabled: false                        # <-- Dump incoming frames to disk
   auto_increment_dirs: true
   save_images: true
   save_depth: true
@@ -56,7 +56,7 @@ dataset:
   results_subdir: "results"
 
 frame_processing:
-  default_client_fps: 2                # Quest streams at ~2 FPS
+  default_client_fps: 3                # Quest streams at ~2 FPS
   initial_frame_index: -1000
   frame_skip_logic: "fps_based"
 
@@ -114,6 +114,9 @@ model:
 
   visualization:
     device: "cuda:0"  # Device for visualization
+    # LAB - MOBILECLIP -  
+    # similarity_threshold=0.870 (client) 
+    # min_match_similarity=0.180 (client) # min_match_similarity - can go to 0.17
     similarity_threshold: 0.86
     min_match_similarity: 0.16       # MobileCLIP floor below which getClipComparison returns empty
     color_ramp_cap: 0.30             # sim value that saturates the colormap
