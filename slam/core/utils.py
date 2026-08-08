@@ -387,47 +387,106 @@ def merge_obj2_into_obj1(cfg, obj1, obj2, run_dbscan=True):
     
     return obj1
 
-def compute_overlap_matrix(cfg, objects: MapObjectList):
+def compute_overlap_matrix(cfg, objects: MapObjectList, time_dict=None):
     '''
-    compute pairwise overlapping between objects in terms of point nearest neighbor. 
-    Suppose we have a list of n point cloud, each of which is a o3d.geometry.PointCloud object. 
-    Now we want to construct a matrix of size n x n, where the (i, j) entry is the ratio of points in point cloud i 
-    that are within a distance threshold of any point in point cloud j. 
+    compute pairwise overlapping between objects in terms of point nearest neighbor.
+    Suppose we have a list of n point cloud, each of which is a o3d.geometry.PointCloud object.
+    Now we want to construct a matrix of size n x n, where the (i, j) entry is the ratio of points in point cloud i
+    that are within a distance threshold of any point in point cloud j.
     '''
     n = len(objects)
     overlap_matrix = np.zeros((n, n))
-    
+    if n == 0:
+        return overlap_matrix
+
     # Convert the point clouds into numpy arrays and then into FAISS indices for efficient search
     point_arrays = [np.asarray(obj['pcd'].points, dtype=np.float32) for obj in objects]
     indices = [faiss.IndexFlatL2(arr.shape[1]) for arr in point_arrays]
-    
+
     # Add the points from the numpy arrays to the corresponding FAISS indices
     for index, arr in zip(indices, point_arrays):
         index.add(arr)
 
-    # Compute the pairwise overlaps
-    for i in range(n):
-        for j in range(n):
-            if i != j:  # Skip diagonal elements
-                box_i = objects[i]['bbox']
-                box_j = objects[j]['bbox']
-                
-                # Skip if the boxes do not overlap at all (saves computation)
-                iou = compute_3d_iou(box_i, box_j)
-                if iou == 0:
-                    continue
-                
-                # # Use range_search to find points within the threshold
-                # _, I = indices[j].range_search(point_arrays[i], threshold ** 2)
-                D, I = indices[j].search(point_arrays[i], 1)
+    # Broad phase: single vectorized AABB overlap check over all N^2 pairs.
+    # compute_3d_iou is already AABB-style under the hood (it uses each bbox's
+    # min/max bound), but called from a Python double-loop it's ~20us * N^2.
+    # Doing the same math via numpy broadcasting costs ~2ms for N=150 and kills
+    # >95% of pairs before the FAISS kNN narrow phase. Toggle via cfg.
+    bp_start = time.perf_counter_ns()
+    if cfg.get('merge_aabb_broadphase', True):
+        mins = np.empty((n, 3), dtype=np.float32)
+        maxs = np.empty((n, 3), dtype=np.float32)
+        for k, obj in enumerate(objects):
+            mins[k] = np.asarray(obj['bbox'].get_min_bound())
+            maxs[k] = np.asarray(obj['bbox'].get_max_bound())
+        aabb_mask = np.all(maxs[:, None, :] >= mins[None, :, :], axis=2) & \
+                    np.all(mins[:, None, :] <= maxs[None, :, :], axis=2)
+        np.fill_diagonal(aabb_mask, False)
+        candidate_pairs = np.argwhere(aabb_mask)
+    else:
+        ii, jj = np.meshgrid(np.arange(n), np.arange(n), indexing='ij')
+        candidate_pairs = np.stack([ii.ravel(), jj.ravel()], axis=1)
+        candidate_pairs = candidate_pairs[candidate_pairs[:, 0] != candidate_pairs[:, 1]]
+    bp_end = time.perf_counter_ns()
 
-                # # If any points are found within the threshold, increase overlap count
-                # overlap += sum([len(i) for i in I])
+    # Semantic prefilter: drop candidate pairs whose CLIP cosine similarity
+    # is at or below cfg.merge_visual_sim_thresh. merge_overlap_objects
+    # already requires visual_sim > thresh AND text_sim > thresh to merge,
+    # so any pair we skip here would also have been skipped at the merge
+    # gate — same merge decisions, just no wasted FAISS work. Single
+    # matmul costs ~0.2 ms even at N=260.
+    sem_start = time.perf_counter_ns()
+    semantic_filtered = 0
+    if cfg.get('merge_semantic_prefilter', True) and len(candidate_pairs) > 0:
+        try:
+            clip_fts = objects.get_stacked_values_torch('clip_ft')
+            if clip_fts.dim() == 2 and clip_fts.shape[0] == n:
+                clip_fts = F.normalize(clip_fts.float(), dim=1)
+                cos_sim = clip_fts @ clip_fts.T
+                ii_ = candidate_pairs[:, 0]
+                jj_ = candidate_pairs[:, 1]
+                sims = cos_sim[ii_, jj_].cpu().numpy()
+                thresh = float(cfg.merge_visual_sim_thresh)
+                keep = sims > thresh
+                semantic_filtered = int((~keep).sum())
+                candidate_pairs = candidate_pairs[keep]
+        except Exception as e:
+            # Defensive: if any object lacks clip_ft or shapes mismatch,
+            # skip the prefilter rather than crash. The narrow phase will
+            # produce a correct overlap_matrix either way.
+            print(f"[compute_overlap_matrix] semantic prefilter skipped: {e}")
+    sem_end = time.perf_counter_ns()
 
-                overlap = (D < cfg.downsample_voxel_size ** 1.7).sum() # D is the squared distance
+    # Narrow phase: only iterate over surviving pairs.
+    narrow_start = time.perf_counter_ns()
+    narrow_survivors = 0
+    for i, j in candidate_pairs:
+        box_i = objects[i]['bbox']
+        box_j = objects[j]['bbox']
 
-                # Calculate the ratio of points within the threshold
-                overlap_matrix[i, j] = overlap / len(point_arrays[i])
+        # Kept for safety — with the AABB prefilter on, this will essentially
+        # never reject a survivor, but is still correct when the filter is off.
+        iou = compute_3d_iou(box_i, box_j)
+        if iou == 0:
+            continue
+
+        D, I = indices[j].search(point_arrays[i], 1)
+        overlap = (D < cfg.downsample_voxel_size ** 1.7).sum() # D is the squared distance
+        overlap_matrix[i, j] = overlap / len(point_arrays[i])
+        if overlap_matrix[i, j] > 0:
+            narrow_survivors += 1
+    narrow_end = time.perf_counter_ns()
+
+    if time_dict is not None:
+        time_dict['merge_n_objects'] = n
+        # broadphase_survivors = AABB-only count (before semantic filter), so
+        # the ratio against semantic_filtered is interpretable.
+        time_dict['merge_broadphase_survivors'] = int(len(candidate_pairs)) + semantic_filtered
+        time_dict['merge_semantic_filtered'] = semantic_filtered
+        time_dict['merge_narrowphase_survivors'] = narrow_survivors
+        time_dict['merge_broadphase_ms'] = (bp_end - bp_start) / 1e6
+        time_dict['merge_semantic_ms'] = (sem_end - sem_start) / 1e6
+        time_dict['merge_narrowphase_ms'] = (narrow_end - narrow_start) / 1e6
 
     return overlap_matrix
 
@@ -471,20 +530,27 @@ def compute_overlap_matrix_2set(cfg, objects_map: MapObjectList, objects_new: De
     bbox_new = torch.from_numpy(np.stack(bbox_new))
     
     iou = compute_iou_batch(bbox_map, bbox_new) # (m, n)
-            
 
-    # Compute the pairwise overlaps
-    for i in range(m):
-        for j in range(n):
-            if iou[i,j] < 1e-6:
-                continue
-            
-            D, I = indices[i].search(points_new[j], 1) # search new object j in map object i
+    # Broad phase survivors: iterate only over pairs with non-trivial AABB
+    # overlap. compute_iou_batch is already vectorized, so this just avoids a
+    # Python-level M*N skip-loop and runs FAISS on the small surviving set.
+    if cfg.get('merge_aabb_broadphase', True):
+        candidate_pairs = np.argwhere(iou.numpy() >= 1e-6) if hasattr(iou, 'numpy') \
+                          else np.argwhere(np.asarray(iou) >= 1e-6)
+    else:
+        ii, jj = np.meshgrid(np.arange(m), np.arange(n), indexing='ij')
+        candidate_pairs = np.stack([ii.ravel(), jj.ravel()], axis=1)
 
-            overlap = (D < cfg.downsample_voxel_size ** 1.7).sum() # D is the squared distance
+    for i, j in candidate_pairs:
+        if iou[i, j] < 1e-6:
+            continue
 
-            # Calculate the ratio of points within the threshold
-            overlap_matrix[i, j] = overlap / len(points_new[j])
+        D, I = indices[i].search(points_new[j], 1) # search new object j in map object i
+
+        overlap = (D < cfg.downsample_voxel_size ** 1.7).sum() # D is the squared distance
+
+        # Calculate the ratio of points within the threshold
+        overlap_matrix[i, j] = overlap / len(points_new[j])
 
     return overlap_matrix
 
@@ -616,13 +682,13 @@ def filter_objects(cfg, objects: MapObjectList, history_map: dict):
     
     return objects, removed_obj, history_map
 
-def merge_objects(cfg, objects: MapObjectList, history_map: dict):
+def merge_objects(cfg, objects: MapObjectList, history_map: dict, time_dict=None):
     removed_objects = []
     edited_objects = []
-    
+
     if cfg.merge_overlap_thresh > 0:
         # Merge one object into another if the former is contained in the latter
-        overlap_matrix = compute_overlap_matrix(cfg, objects)
+        overlap_matrix = compute_overlap_matrix(cfg, objects, time_dict=time_dict)
         print("Before merging:", len(objects))
         objects, removed_objects, edited_objects, history_map, merge_events = merge_overlap_objects(cfg, objects, overlap_matrix, history_map=history_map)
         print("After merging:", len(objects))
@@ -1169,20 +1235,35 @@ def gobs_to_detection_list_optimized(
     pcd_creation_times_ms = []
     pcd_process_times_ms = []
 
-    resize_filter_start = time.perf_counter_ns()
+    filter_start = time.perf_counter_ns()
+
+    t0 = time.perf_counter_ns()
     gobs = resize_gobs(gobs, image)
+    if time_dict is not None:
+        time_dict['resize_masks_ms'] = (time.perf_counter_ns() - t0) / 1e6
+
+    t0 = time.perf_counter_ns()
     gobs = filter_gobs(cfg, gobs, image, BG_CLASSES, pipelined_mapping=pipelined_mapping)
-    resize_filter_end = time.perf_counter_ns()
-    # if time_dict is not None:
-    #     time_dict['resize_filter_time'] = (resize_filter_end - resize_filter_start)/1e6
+    if time_dict is not None:
+        time_dict['drop_masks_ms'] = (time.perf_counter_ns() - t0) / 1e6
 
     if len(gobs['xyxy']) == 0:
+        if time_dict is not None:
+            time_dict['subtract_contained_ms'] = 0.0
+            time_dict['n_contained_pairs'] = 0
+            time_dict['gobs_filter_ms'] = (time.perf_counter_ns() - filter_start) / 1e6
         return fg_detection_list, bg_detection_list, []
 
     # Subtract containment as before
     xyxy = gobs['xyxy']
     mask = gobs['mask']
-    gobs['mask'] = mask_subtract_contained(xyxy, mask)
+    t0 = time.perf_counter_ns()
+    gobs['mask'] = mask_subtract_contained(xyxy, mask, time_dict=time_dict)
+    if time_dict is not None:
+        time_dict['subtract_contained_ms'] = (time.perf_counter_ns() - t0) / 1e6
+        # gobs_filter_ms = resize + class/conf/area filter + containment subtract.
+        # Pure frame-local cost (no global-map references).
+        time_dict['gobs_filter_ms'] = (time.perf_counter_ns() - filter_start) / 1e6
 
     # Init timing buckets (same keys you used before)
     if time_dict is not None:
@@ -1195,7 +1276,12 @@ def gobs_to_detection_list_optimized(
         time_dict['downsample_time'] = 0.0
 
     n_masks = len(gobs['xyxy'])
+    if time_dict is not None:
+        time_dict['n_masks'] = n_masks
     if n_masks == 0:
+        if time_dict is not None:
+            time_dict['n_unprojected'] = 0
+            time_dict['n_detections_kept'] = 0
         return fg_detection_list, bg_detection_list, []
 
     # ---- Frame-wide unprojection ----
@@ -1215,6 +1301,10 @@ def gobs_to_detection_list_optimized(
     )
     make_pcds_end = time.perf_counter_ns()
     pcd_creation_times_ms.append((make_pcds_end - make_pcds_start)/1e6)
+    if time_dict is not None:
+        # n_unprojected = masks that produced >=1 valid 3D point from the depth
+        # buffer. Gap between n_masks and n_unprojected = masks with no/bad depth.
+        time_dict['n_unprojected'] = len(obj_pcds)
 
     idx_to_keep = []
 
@@ -1293,5 +1383,8 @@ def gobs_to_detection_list_optimized(
     if time_dict is not None:
         time_dict['pcd_creation_time'] = np.sum(pcd_creation_times_ms)
         time_dict['pcd_process_time']  = np.sum(pcd_process_times_ms)
+        # n_detections_kept = survivors of the per-mask loop (min_points,
+        # degenerate bbox, etc.). This is the count that actually enters the map.
+        time_dict['n_detections_kept'] = len(idx_to_keep)
 
     return fg_detection_list, bg_detection_list, idx_to_keep

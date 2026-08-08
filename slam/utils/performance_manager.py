@@ -49,6 +49,42 @@ class FrameTimingData:
     merge_objects_time: float = 0.0
     post_processing_time: float = 0.0
     num_objects: int = 0
+    # Per-frame detection funnel (see gobs_to_detection_list_optimized):
+    #   n_masks            = masks handed to mapping (pre-unprojection)
+    #   n_unprojected      = masks that produced a valid 3D pcd from depth
+    #   n_detections_kept  = survivors of min-points / degenerate-bbox filter
+    n_masks: int = 0
+    n_unprojected: int = 0
+    n_detections_kept: int = 0
+    # gobs_creation_time covers the WHOLE create_pcd_parallel call (in
+    # mapping_utils.py). To localize where its growth comes from, the three
+    # sub-timers below split it into:
+    #   dataset_getitems_ms = dataset.getItems (CPU↔GPU transfers)
+    #   tensor_to_numpy_ms  = the .cpu().numpy() block (CUDA sync points)
+    #   gobs_inner_ms       = gobs_to_detection_list_optimized only
+    # And inside gobs_inner_ms:
+    #   gobs_filter_ms      = resize + class/conf filter + containment
+    #   pcd_creation_time   = frame_to_object_pcds (frame-wide unprojection)
+    #   pcd_process_time    = per-mask DBSCAN/downsample/OBB
+    dataset_getitems_ms: float = 0.0
+    tensor_to_numpy_ms: float = 0.0
+    gobs_inner_ms: float = 0.0
+    gobs_filter_ms: float = 0.0          # = resize_masks + drop_masks + subtract_contained
+    resize_masks_ms: float = 0.0         # cv2.resize per mask
+    drop_masks_ms: float = 0.0           # filter_gobs() class/conf/area filter
+    subtract_contained_ms: float = 0.0   # mask_subtract_contained() (Python loop over contained pairs)
+    n_contained_pairs: int = 0           # iterations of the Python loop in mask_subtract_contained
+    pcd_creation_time: float = 0.0
+    pcd_process_time: float = 0.0
+    # merge_objects() internal breakdown — only populated on frames where the
+    # merge step fires (every cfg.merge_interval frames). Zero otherwise.
+    merge_n_objects: int = 0
+    merge_broadphase_survivors: int = 0
+    merge_semantic_filtered: int = 0
+    merge_narrowphase_survivors: int = 0
+    merge_broadphase_ms: float = 0.0
+    merge_semantic_ms: float = 0.0
+    merge_narrowphase_ms: float = 0.0
     server_timestamp: Optional[int] = None
     client_timestamp: Optional[int] = None
     queue_sizes: Optional[Dict[str, int]] = None
@@ -180,6 +216,14 @@ class PerformanceManager:
             'gobs_creation_time', 'similarity_time', 'merging_time',
             'post_process_denoise_time', 'filter_objects_time',
             'merge_objects_time', 'post_processing_time', 'num_objects',
+            'n_masks', 'n_unprojected', 'n_detections_kept',
+            'dataset_getitems_ms', 'tensor_to_numpy_ms', 'gobs_inner_ms',
+            'gobs_filter_ms', 'resize_masks_ms', 'drop_masks_ms',
+            'subtract_contained_ms', 'n_contained_pairs',
+            'pcd_creation_time', 'pcd_process_time',
+            'merge_n_objects', 'merge_broadphase_survivors',
+            'merge_semantic_filtered', 'merge_narrowphase_survivors',
+            'merge_broadphase_ms', 'merge_semantic_ms', 'merge_narrowphase_ms',
             'server_timestamp', 'client_timestamp'
         ]
         # If an older CSV exists with a mismatched header, rotate it aside so
@@ -269,6 +313,26 @@ class PerformanceManager:
                 merge_objects_time=timing_dict.get('merge_objects_time', 0.0),
                 post_processing_time=timing_dict.get('post_processing_time', 0.0),
                 num_objects=int(timing_dict.get('num_objects', 0)),
+                n_masks=int(timing_dict.get('n_masks', 0)),
+                n_unprojected=int(timing_dict.get('n_unprojected', 0)),
+                n_detections_kept=int(timing_dict.get('n_detections_kept', 0)),
+                dataset_getitems_ms=float(timing_dict.get('dataset_getitems_ms', 0.0)),
+                tensor_to_numpy_ms=float(timing_dict.get('tensor_to_numpy_ms', 0.0)),
+                gobs_inner_ms=float(timing_dict.get('gobs_inner_ms', 0.0)),
+                gobs_filter_ms=float(timing_dict.get('gobs_filter_ms', 0.0)),
+                resize_masks_ms=float(timing_dict.get('resize_masks_ms', 0.0)),
+                drop_masks_ms=float(timing_dict.get('drop_masks_ms', 0.0)),
+                subtract_contained_ms=float(timing_dict.get('subtract_contained_ms', 0.0)),
+                n_contained_pairs=int(timing_dict.get('n_contained_pairs', 0)),
+                pcd_creation_time=float(timing_dict.get('pcd_creation_time', 0.0)),
+                pcd_process_time=float(timing_dict.get('pcd_process_time', 0.0)),
+                merge_n_objects=int(timing_dict.get('merge_n_objects', 0)),
+                merge_broadphase_survivors=int(timing_dict.get('merge_broadphase_survivors', 0)),
+                merge_semantic_filtered=int(timing_dict.get('merge_semantic_filtered', 0)),
+                merge_narrowphase_survivors=int(timing_dict.get('merge_narrowphase_survivors', 0)),
+                merge_broadphase_ms=float(timing_dict.get('merge_broadphase_ms', 0.0)),
+                merge_semantic_ms=float(timing_dict.get('merge_semantic_ms', 0.0)),
+                merge_narrowphase_ms=float(timing_dict.get('merge_narrowphase_ms', 0.0)),
                 server_timestamp=server_timestamp,
                 client_timestamp=client_timestamp,
                 queue_sizes=queue_sizes,

@@ -450,7 +450,7 @@ def compute_2d_box_contained_batch(bbox: torch.Tensor, thresh:float=0.95) -> tor
 
     return count
 
-def mask_subtract_contained(xyxy: np.ndarray, mask: np.ndarray, th1=0.8, th2=0.7):
+def mask_subtract_contained(xyxy: np.ndarray, mask: np.ndarray, th1=0.8, th2=0.7, time_dict=None):
     '''
     Compute the containing relationship between all pair of bounding boxes.
     For each mask, subtract the mask of bounding boxes that are contained by it.
@@ -487,6 +487,12 @@ def mask_subtract_contained(xyxy: np.ndarray, mask: np.ndarray, th1=0.8, th2=0.7
     # then box2 is considered contained by box1
     contained = (inter_over_box1 < th2) & (inter_over_box2 > th1) # (N, N)
     contained_idx = contained.nonzero() # (num_contained, 2)
+
+    if time_dict is not None:
+        # Number of (i, j) pairs that hit the Python loop below. Each iteration
+        # is O(H*W) in bool ops on a (H, W) mask, so total cost scales as
+        # n_contained_pairs * mask resolution.
+        time_dict['n_contained_pairs'] = int(len(contained_idx[0]))
 
     mask_sub = mask.copy() # (N, H, W)
     # mask_sub[contained_idx[0]] = mask_sub[contained_idx[0]] & (~mask_sub[contained_idx[1]])

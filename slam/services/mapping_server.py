@@ -333,7 +333,7 @@ def mapping_consumer(mappingQueue, visualizationQueue, useDetector=False, datase
             time_dict['filter_objects_time'] = (time.perf_counter_ns() - filter_start)/1e6
         if cfg.merge_interval > 0 and (idx+1) % cfg.merge_interval == 0:
             merge_objs_start = time.perf_counter_ns()
-            objects, removed_object_2, edited_objects_idx_2, history_map = merge_objects(cfg, objects, history_map)
+            objects, removed_object_2, edited_objects_idx_2, history_map = merge_objects(cfg, objects, history_map, time_dict=time_dict)
             # O(N^2) pairwise FAISS overlap step — main super-linear term.
             time_dict['merge_objects_time'] = (time.perf_counter_ns() - merge_objs_start)/1e6
         time_dict['num_objects'] = len(objects)

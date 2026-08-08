@@ -273,25 +273,35 @@ def resolve_session_max_depth(client_value, cfg):
 
 
 def create_pcd_parallel(image_np, depth_array, pose, frameNumber, dataset, cfg, classes, gobs, output_receiver_list, pipelined_mapping, datasetClass, time_dict, max_depth_m=None):
-    start = time.perf_counter_ns()  
+    # NOTE: gobs_creation_time spans this WHOLE function — not just the
+    # gobs_to_detection_list_optimized call. To diagnose drift we now also
+    # report dataset_getitems_ms (CPU↔GPU transfers in dataset.getItems),
+    # tensor_to_numpy_ms (the .cpu().numpy() block — CUDA sync points), and
+    # gobs_inner_ms (the actual gobs algorithmic work). The three should
+    # roughly sum to gobs_creation_time.
+    start = time.perf_counter_ns()
+
+    getitems_start = time.perf_counter_ns()
     color_tensor, depth_tensor, intrinsics, unt_pose = dataset.getItems(image_np, depth_array, pose)
-    assert not pipelined_mapping, "pipelined_mapping must be False to reach here"
-        
+    time_dict['dataset_getitems_ms'] = (time.perf_counter_ns() - getitems_start) / 1e6
+
+    sync_start = time.perf_counter_ns()
     color_np = color_tensor.cpu().numpy() # (H, W, 3)
     image_rgb = (color_np).astype(np.uint8) # (H, W, 3)
-    
+
     # Get the depth image
     depth_tensor = depth_tensor[..., 0]
     depth_array = depth_tensor.cpu().numpy()
 
     # Get the intrinsics matrix
     cam_K = intrinsics.cpu().numpy()[:3, :3]
-    
+
     unt_pose = unt_pose.cpu().numpy()
     # Don't apply any transformation otherwise
     adjusted_pose = unt_pose
-    
-    
+    time_dict['tensor_to_numpy_ms'] = (time.perf_counter_ns() - sync_start) / 1e6
+
+    gobs_start = time.perf_counter_ns()
     fg_detection_list, bg_detection_list, idx_to_keep = gobs_to_detection_list_optimized(
         cfg = cfg,
         image = image_rgb,
@@ -308,11 +318,13 @@ def create_pcd_parallel(image_np, depth_array, pose, frameNumber, dataset, cfg, 
         time_dict=time_dict,
         max_depth_m=max_depth_m,
     )
+    time_dict['gobs_inner_ms'] = (time.perf_counter_ns() - gobs_start) / 1e6
+
     output_receiver_list.append(fg_detection_list)
     output_receiver_list.append(bg_detection_list)
     output_receiver_list.append(idx_to_keep)
-    time_to_get_data = time.perf_counter_ns() 
-    # print(f"Create GOBS: {(time_to_get_data - start)/1e6} ms")
-    time_dict['mapping_time'] = (time.perf_counter_ns() - start)/1e6
-    time_dict['gobs_creation_time'] = (time.perf_counter_ns() - start)/1e6
+
+    total_ms = (time.perf_counter_ns() - start) / 1e6
+    time_dict['mapping_time'] = total_ms
+    time_dict['gobs_creation_time'] = total_ms
 
