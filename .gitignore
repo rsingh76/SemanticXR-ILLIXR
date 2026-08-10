@@ -1,17 +1,21 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 
+# NOTE: directory patterns below are anchored with a leading "/" so they match
+# only at the repo root. Unanchored patterns match at ANY depth, which
+# previously hid 14 tracked files (slam/datasets/*, tests/*, .vscode/settings.json)
+# and silently swallowed anything newly added there.
+
 *.log
 *.xcodeproj
 .DS_Store
 /.dazel_run
 /bazel-*
-settings.json
+/settings.json
 *.pyc
 __pycache__/
 *__pycache__/
-external/
-tests/
+/external/
 yolov8l-world.pt
 IMPORT_REFACTORING_SUMMARY.md
 code_quality_recommendations.md
@@ -22,8 +26,7 @@ slam/protocols/vis_proto/vis_pb2.py
 slam/protocols/vis_proto/vis_pb2.pyi
 slam/protocols/vis_proto/vis_pb2_grpc.py
 config/production.yaml
-semantic_slam_server.egg-info/
-.github/
+*.egg-info/
 
 # Runtime artifacts (don't track generated data)
 logs_performance/
@@ -38,4 +41,4 @@ server/xr_service_pb2.py
 server/xr_service_pb2_grpc.py
 
 # Generated visualization images (scripts/visualize_e2e.py)
-outputs/
+/outputs/
