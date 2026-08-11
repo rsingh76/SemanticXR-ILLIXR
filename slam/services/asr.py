@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
+
 """Speech-to-text for the visualization server.
 
 Encapsulates backend selection (faster-whisper / openai-whisper / openai-api),

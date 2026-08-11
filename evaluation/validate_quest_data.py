@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
+
 """Validate Quest collected data by loading and visualizing RGB-D-Pose frames.
 
 Usage:

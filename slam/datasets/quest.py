@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
+
 """Meta Quest dataset implementation for semantic SLAM operations.
 
 Local-file mode (replay): a scene directory written by
