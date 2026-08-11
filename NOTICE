@@ -1,0 +1,84 @@
+SemanticXR-ILLIXR
+=================
+
+This product includes software developed by NVIDIA CORPORATION & AFFILIATES.
+
+
+Upstream
+--------
+
+This repository is a derivative work of NVIDIA's xr-ai project:
+
+    Project: https://github.com/NVIDIA/xr-ai
+    Path:    experimental/semantic-slam-source
+    Commit:  1213361a60d081e34426572856fc983f8188d02d
+    License: Apache-2.0
+
+All inherited files retain their original NVIDIA copyright notices and SPDX
+headers, unmodified.
+
+
+Modifications to upstream files
+------------------------------
+
+Provided in accordance with Apache License 2.0, Section 4(b). The following
+files from the upstream snapshot have been changed in this repository:
+
+  * LICENSE
+        Added. The upstream snapshot omitted it because xr-ai ships a LICENSE
+        at its own repository root; this repository is standalone, and every
+        source file carries an SPDX-License-Identifier: Apache-2.0 header.
+        Copied verbatim from xr-ai.
+
+  * .gitignore
+        Anchored root-only directory patterns with a leading "/". The
+        unanchored forms matched at any depth and hid 14 already-tracked
+        files. Removed the "tests/" rule (the repository tracks test sources)
+        and the ".github/" rule (it blocked CI workflow files). Generalised
+        "semantic_slam_server.egg-info/" to "*.egg-info/".
+
+  * pyproject.toml
+        Added an "asr" optional-dependency group declaring openai-whisper and
+        faster-whisper, which slam/services/asr.py imports but which were
+        previously undeclared.
+
+  * README.md
+        Corrected a dangling link to THIRD_PARTY_LICENSES.md (this repository
+        ships THIRD_PARTY_NOTICES.md) and updated the licensing paragraph to
+        reference LICENSE and pyproject.toml.
+
+  * THIRD_PARTY_NOTICES.md
+        Removed the torchaudio entry and the sentence describing setup.py's
+        dependency set, following the removal of setup.py. torchaudio is not
+        imported anywhere in this source tree.
+
+  * setup.py
+        Removed. pyproject.toml declares a [build-system] using hatchling, so
+        PEP 517 builds already ignored setup.py. It had drifted to a different
+        package name and referenced an entry point module not present in the
+        tree.
+
+
+Additions
+---------
+
+Branches other than "main" contain work that is not part of the upstream
+snapshot, including Quest streaming support, merge/GOBS performance
+diagnostics, human-ignore filtering, and ILLIXR integration via the
+semantic_python relay.
+
+Files original to this repository carry the following notice:
+
+    SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of
+    Illinois Urbana-Champaign <rahuls10@illinois.edu>
+    SPDX-License-Identifier: Apache-2.0
+
+These additions are licensed under Apache-2.0, the same terms as the upstream
+work.
+
+
+Third-party components
+----------------------
+
+See THIRD_PARTY_NOTICES.md for the dependency inventory, SPDX identifiers, and
+notes on externally provisioned model components and checkpoints.
