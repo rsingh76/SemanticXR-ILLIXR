@@ -578,13 +578,13 @@ env | grep SLAM_
 
 ## Licensing
 
-This repository is being migrated to Apache-2.0. The Python package and every dependency declared in `setup.py` is permissive-licensed (BSD-3, MIT, Apache-2.0, HPND, or NVIDIA proprietary runtime SDK). The repo contains:
+This repository is licensed under Apache-2.0 (see [`LICENSE`](./LICENSE)). The Python package and every dependency declared in `pyproject.toml` is permissive-licensed (BSD-3, MIT, Apache-2.0, HPND, or NVIDIA proprietary runtime SDK). The repo contains:
 
 - **No AGPL/GPL Python deps** (the previously-declared `ultralytics` has been removed).
 - **No LGPL Python deps**, and the default code path no longer links into LGPL native libraries (PyAV → PyNvVideoCodec swap; `imageio` is used only for offline PNG reads via Pillow; the optional MP4 animation export is gated behind an actionable error if `imageio-ffmpeg` isn't installed).
 - **NVIDIA proprietary runtime SDKs**: CUDA, cuDNN, NCCL, TensorRT, and the NVIDIA Video Codec SDK are required runtime dependencies but are not redistributed by this repository.
 
-For the full dependency inventory and SPDX identifiers, see [`THIRD_PARTY_LICENSES.md`](./THIRD_PARTY_LICENSES.md).
+For the full dependency inventory and SPDX identifiers, see [`THIRD_PARTY_NOTICES.md`](./THIRD_PARTY_NOTICES.md).
 
 ## TODOs — Visualization Path
 
