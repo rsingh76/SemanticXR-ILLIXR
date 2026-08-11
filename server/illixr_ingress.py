@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
 """ILLIXR ingress: convert a switchboard ``semantic_data`` dict to the inference
 9-tuple, reusing the EXACT decoders of the live Quest gRPC path so the result is
 identical-by-construction to ``grpc_server._process_frame_request`` (is_quest).

@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
+
 # Quest debug configuration (MobileCLIP variant, capture off by default).
 #
 # Same intent as quest_debug.yaml — replay-ready Quest dumps with all the

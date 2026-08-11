@@ -1,4 +1,6 @@
 #!/usr/bin/env bash
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
 #
 # Launch this SemanticXR semantic-slam-server INSIDE ILLIXR via the
 # `semantic_python` plugin, using the `sceneGraphDemo` conda environment.

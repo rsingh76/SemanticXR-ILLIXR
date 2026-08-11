@@ -1,3 +1,6 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
+# SPDX-License-Identifier: Apache-2.0
+
 """Test Quest point cloud reconstruction from RGB-D-Pose without inference.
 
 Verifies that depth unprojection + pose transforms produce a sensible 3D scene.
