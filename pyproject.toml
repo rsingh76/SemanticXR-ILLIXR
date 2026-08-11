@@ -68,6 +68,15 @@ dependencies = [
 dev = [
     "pytest>=8.0",
 ]
+# Local ASR backends for slam/services/asr.py. Imported lazily inside the
+# backend branch, so a clean install only fails when one is actually selected
+# via asr.backend. The "openai-api" backend needs none of these -- it uses the
+# already-declared `openai` client. Left unpinned so `uv lock` picks the
+# resolvable versions for the pinned torch.
+asr = [
+    "openai-whisper",
+    "faster-whisper",
+]
 
 [project.scripts]
 semantic-slam-server = "server.main:main"
