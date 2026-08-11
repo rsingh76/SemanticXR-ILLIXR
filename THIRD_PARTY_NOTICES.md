@@ -18,14 +18,13 @@ runtime SDKs; review those artifacts separately before deployment.
 
 ## Direct Python dependencies
 
-These constraints are declared by this snapshot's `pyproject.toml`; `setup.py`
-also declares `torchaudio>=2.0.2` for its older setuptools path.
+These constraints are declared by this snapshot's `pyproject.toml`, which is the
+sole packaging manifest (PEP 517 build via hatchling).
 
 | Package | Manifest constraint | License | Upstream |
 |---|---|---|---|
 | `torch` | `==2.0.1` | BSD-3-Clause | https://github.com/pytorch/pytorch |
 | `torchvision` | `==0.15.2` | BSD-3-Clause | https://github.com/pytorch/vision |
-| `torchaudio` | `>=2.0.2` (`setup.py` only) | BSD-3-Clause | https://github.com/pytorch/audio |
 | `numpy` | `>=1.24.3,<2` | BSD-3-Clause; see binary-wheel note | https://github.com/numpy/numpy |
 | `opencv-python` | `>=4.9.0,<4.11.0` | Apache-2.0 | https://github.com/opencv/opencv-python |
 | `Pillow` | `>=9.5.0` | HPND | https://github.com/python-pillow/Pillow |
