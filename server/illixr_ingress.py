@@ -2,24 +2,33 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 Rahul Singh, University of Illinois Urbana-Champaign <rahuls10@illinois.edu>
 # SPDX-License-Identifier: Apache-2.0
 """ILLIXR ingress: convert a switchboard ``semantic_data`` dict to the inference
-9-tuple, reusing the EXACT decoders of the live Quest gRPC path so the result is
-identical-by-construction to ``grpc_server._process_frame_request`` (is_quest).
+9-tuple, reusing the EXACT depth decode and reprojection of the live Quest gRPC
+path so the result is identical-by-construction to
+``grpc_server._process_frame_request`` (is_quest).
 
-This runs inside the **inference worker process** (not the relay), so:
-  * the relay stays lean — it just ships the raw dict over the mp.Queue;
-  * the ~6 MB decoded RGB+depth arrays are never pickled across the boundary;
-  * the H.265 decoder (which is inter-frame / stateful) lives in one place and
-    persists across frames for the whole session.
+This runs inside the **inference worker process** (not the relay), so the
+converted payload is never pickled across the mp.Queue boundary: the raw dict is
+~5 MB/frame (1280x1280x3 RGB + 320x320x2 depth) while the 9-tuple is ~9 MB
+(two RGB copies at the processing resolution + a float32 depth-in-RGB map).
+Converting here keeps the smaller form on the queue and keeps the relay loop —
+which also services voice queries and drains responses — free of per-frame work.
 
-ASSUMPTION (verify at bring-up): ILLIXR's ``semantic_data.image`` is H.265/HEVC
-and ``.depth`` is raw R16_SFloat — the same wire format the Quest client sends
-over gRPC. The struct (include/illixr/data_format/semantics.hpp) stores opaque
-byte vectors; the producer is the upstream Quest client/bridge. If the format
-differs, decode fails loudly here (None return → frame dropped) rather than
-silently corrupting the map.
+RGB IS ALREADY DECODED. As of ILLIXR commit 12a3f448 the ``semantic_python``
+plugin GPU-decodes the H.265 stream with NVDEC and hands Python an (H, W, 3)
+uint8 array (``entry_to_numpy`` in switchboard_bindings.hpp). Earlier revisions
+of the plugin (through 9256b074, 2026-06-11) passed the encoded HEVC bytes and
+this file decoded them itself; that path is gone. Depth is still delivered raw.
+If ``cmake/GetSemanticXR.cmake``'s pin is ever moved back to a pre-12a3f448
+plugin, this file must be reverted in lockstep.
 
-semantic_data dict schema (plugins/semantic_python/switchboard_bindings.hpp:91-103):
-  image, depth            numpy uint8 (flat)  — encoded bytes
+The plugin returns an EMPTY ``image`` array when its decoded-frame cache has no
+entry for the frame (decode not finished, decoder still buffering, decode error,
+or eviction), so an empty/ill-shaped array here means "drop this frame", not
+"corrupt input".
+
+semantic_data dict schema (plugins/semantic_python/switchboard_bindings.hpp:124-144):
+  image                   numpy uint8 (H, W, 3) — DECODED RGB, may be empty
+  depth                   numpy uint8 (flat)    — raw R16_UNORM bytes
   frame_number            int
   image_width/height      int                 — native RGB resolution
   depth_width/height      int                 — native depth resolution
@@ -37,7 +46,6 @@ import numpy as np
 import yaml
 from PIL import Image
 
-from server.components.video_processor import VideoProcessor
 from server.components.grpc_server import _decode_quest_depth_bytes
 from slam.datasets.quest import build_depth_in_rgb_frame
 
@@ -56,34 +64,32 @@ def _quest_target_resolution():
 
 
 class IllixrFrameConverter:
-    """Stateful (persistent H.265 decoder) converter — one per worker session."""
+    """semantic_data dict -> inference 9-tuple. One per worker session."""
 
     def __init__(self, config=None):
-        self._vp = VideoProcessor(config)
+        # No video decoder here: ILLIXR decodes on the GPU (see module docstring).
         self._target_w, self._target_h = _quest_target_resolution()
-        print(f"🔁 [ingress] IllixrFrameConverter ready (target {self._target_w}x{self._target_h})", flush=True)
+        self._dims_warned = False
+        print(f"🔁 [ingress] IllixrFrameConverter ready (ILLIXR-decoded RGB, target {self._target_w}x{self._target_h})", flush=True)
 
     def convert(self, f):
         """semantic_data dict -> inference 9-tuple, or None to drop the frame.
 
         Mirrors grpc_server._process_frame_request is_quest path:
-          - H.265 decode (grpc_server.py:314-329)
+          - RGB arrives decoded from ILLIXR (no H.265 step; see module docstring)
           - R16 depth decode (grpc_server.py:343-346)
           - meta + build_depth_in_rgb_frame + LANCZOS resize (grpc_server.py:401-423)
           - pose = [frame] + 16 row-major c2w, unflipped (grpc_server.py:366-372)
           - 9-tuple layout (inference_service.py:129-139)
         """
-        # ---- RGB: H.265 -> PIL (native res) ----
-        video_data = bytes(f["image"])
-        if not video_data:
-            return None
-        processed_frame, is_valid = self._vp.process_video_frame(video_data, codec="h265")
-        if not is_valid or processed_frame is None:
-            return None
-        if isinstance(processed_frame, Image.Image):
-            image_pil = processed_frame
-        else:  # np.ndarray (rgb24)
-            image_pil = Image.fromarray(processed_frame)
+        # ---- RGB: already decoded by ILLIXR as (H, W, 3) uint8 ----
+        rgb = np.asarray(f["image"])
+        if rgb.size == 0 or rgb.ndim != 3 or rgb.shape[2] != 3:
+            return None  # cache miss / decoder still buffering -> drop frame
+        if rgb.dtype != np.uint8:
+            rgb = rgb.astype(np.uint8, copy=False)
+        image_pil = Image.fromarray(rgb, mode="RGB")
+        native_h, native_w = int(rgb.shape[0]), int(rgb.shape[1])
 
         # ---- depth: R16_SFloat -> metric float32 (native res) ----
         depth_native = _decode_quest_depth_bytes(
@@ -104,12 +110,22 @@ class IllixrFrameConverter:
             "fx": float(intr[0]), "fy": float(intr[1]), "cx": float(intr[2]), "cy": float(intr[3]),
             "depth_fx": float(dintr[0]), "depth_fy": float(dintr[1]),
             "depth_cx": float(dintr[2]), "depth_cy": float(dintr[3]),
-            "image_width": int(f["image_width"]), "image_height": int(f["image_height"]),
+            # Use the decoded array's own dimensions: build_depth_in_rgb_frame
+            # scales projected depth coords by target/native, and the RGB below is
+            # resized from this same shape. If the plugin's reported intrinsics
+            # resolution disagrees, fx/fy/cx/cy are inconsistent with the pixels
+            # too — that is a producer bug we can only surface, not repair.
+            "image_width": native_w, "image_height": native_h,
         }
+        rep_w, rep_h = int(f["image_width"]), int(f["image_height"])
+        if (rep_w, rep_h) != (native_w, native_h) and not self._dims_warned:
+            self._dims_warned = True
+            print(f"⚠️  [ingress] decoded RGB is {native_w}x{native_h} but semantic_data "
+                  f"reports {rep_w}x{rep_h}; intrinsics do not match the pixels", flush=True)
 
         # ---- align depth into RGB frame + downsample RGB to processing res ----
         depth_array = build_depth_in_rgb_frame(meta, depth_native, self._target_h, self._target_w)
-        image_pil = image_pil.convert("RGB").resize((self._target_w, self._target_h), Image.LANCZOS)
+        image_pil = image_pil.resize((self._target_w, self._target_h), Image.LANCZOS)
         image_array = np.array(image_pil)
 
         # ---- pose: [frame] + 16 row-major c2w (NOT flipped; matches gRPC) ----
