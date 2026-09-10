@@ -87,6 +87,9 @@ def _prepare_runtime(args, config):
     return scene_name, run_output_dir
 
 
+_SAVE_TRIGGER = os.environ.get("ILLIXR_SAVE_TRIGGER", "/tmp/illixr_save_map")
+
+
 def run():
     args = get_parser().parse_args(sys.argv[1:])
 
@@ -116,6 +119,15 @@ def run():
     # NOTE: we deliberately do NOT call install_signal_handlers() — signal.signal
     # only works on the main thread, and the relay runs on the plugin's worker
     # thread. ILLIXR --duration / process teardown drives shutdown.
+
+    # Clear any stale save trigger left over from a previous session, otherwise
+    # this one exits on its first loop iteration and dumps an empty map.
+    if os.path.exists(_SAVE_TRIGGER):
+        try:
+            os.remove(_SAVE_TRIGGER)
+            print(f"🧽 [relay] cleared stale save trigger {_SAVE_TRIGGER}", flush=True)
+        except OSError:
+            pass
 
     frameQ = mp.Queue(maxsize=config.server.inference_queue_size)        # relay -> inference
     visualizationQueue = mp.Queue(maxsize=config.server.visualization_queue_size)  # inference -> viz (direct)
@@ -192,6 +204,21 @@ def run():
                     total_pts = sum(len(pc["points"]) // 3 for pc in r["point_clouds"])
                     print(f"📤 [relay] response sent #{r['query_id']} "
                           f"({len(r['point_clouds'])} clouds, {total_pts} pts) -> switchboard", flush=True)
+
+
+            # Deliberate, graceful stop: `touch /tmp/illixr_save_map`.
+            # Breaking here runs the finally block below, which enqueues
+            # scene_completion -> dump_semantic_map (--save_map) + shutdown.
+            # Ctrl+C cannot do this: the embedded interpreter is torn down
+            # abruptly and finally: is not guaranteed to run.
+            if os.path.exists(_SAVE_TRIGGER):
+                try:
+                    os.remove(_SAVE_TRIGGER)
+                except OSError:
+                    pass
+                print(f"💾 [relay] save trigger seen ({_SAVE_TRIGGER}); "
+                      f"stopping cleanly so the map is dumped", flush=True)
+                break
 
             if not inference_proc.is_alive():
                 print("❌ [relay] inference process died; exiting relay loop", flush=True)
