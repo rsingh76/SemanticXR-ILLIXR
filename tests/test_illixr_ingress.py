@@ -43,12 +43,13 @@ NATIVE_W = NATIVE_H = 1280   # Quest RGB sensor
 DEPTH_W = DEPTH_H = 320      # Quest environment-depth sensor
 
 
-def _fake_frame(frame_number=7, image=None, near_z=-0.2, max_depth=0.0):
+def _fake_frame(frame_number=7, image=None, near_z=0.1, max_depth=0.0):
     """A semantic_data dict with the key set and dtypes the plugin produces."""
     if image is None:
         rng = np.random.default_rng(0)
         image = rng.integers(0, 256, size=(NATIVE_H, NATIVE_W, 3), dtype=np.uint8)
-    # R16_UNORM depth: mid-range values so depth_m stays finite and positive.
+    # ILLIXR encodes depth as u16_norm = 1 - near_z/depth_m, so
+    # depth_m = near_z / (1 - u16/65535).  30000 -> 0.1/0.5422 = 0.184 m.
     depth_u16 = np.full((DEPTH_H, DEPTH_W), 30000, dtype=np.uint16)
     eye = np.eye(4, dtype=np.float32)
     return {
@@ -82,6 +83,11 @@ def test_convert_returns_well_formed_9_tuple():
     assert image_pil.mode == "RGB"
     assert image_array.shape == (th, tw, 3) and image_array.dtype == np.uint8
     assert depth_array.shape == (th, tw) and depth_array.dtype == np.float32
+    # NB: depth_array is post-reprojection (build_depth_in_rgb_frame) with the
+    # synthetic identity poses here, so it can legitimately be empty. The decode
+    # contract itself is covered by convert() returning non-None -- it drops the
+    # frame when no pixel yields positive depth -- and by
+    # test_undecodable_depth_drops_the_frame below.
     assert len(pose_data) == 17 and pose_data[0] == 7   # [frame] + 16 row-major
     assert frame_number == 7
     assert isinstance(client_ts, int) and isinstance(server_ts, int)
@@ -106,6 +112,14 @@ def test_unusable_image_drops_the_frame(bad_image):
     assert IllixrFrameConverter().convert(_fake_frame(image=bad_image)) is None
 
 
+def test_undecodable_depth_drops_the_frame():
+    """u16 == 65535 means 1 - u16_norm == 0: no finite depth, drop the frame."""
+    f = _fake_frame()
+    f["depth"] = np.frombuffer(
+        np.full((DEPTH_H, DEPTH_W), 65535, dtype=np.uint16).tobytes(), dtype=np.uint8)
+    assert IllixrFrameConverter().convert(f) is None
+
+
 def test_dimensions_come_from_the_decoded_array(capsys):
     """If the plugin's reported resolution disagrees with the decoded array, the
     array wins (it is what gets resized) and the mismatch is reported once."""
@@ -115,6 +129,71 @@ def test_dimensions_come_from_the_decoded_array(capsys):
     assert conv.convert(f) is not None
     assert "do not match the pixels" in capsys.readouterr().out
     assert conv.convert(f) is not None    # warn-once, not once per frame
+
+
+class _RecordingDumper:
+    """Stands in for ``SLAMGRPCServer``; captures the shim ``convert()`` builds."""
+
+    def __init__(self):
+        self.shim = None
+
+    def _save_quest_replay_frame(self, frame_number, image_pil, depth_native, request, server_ts):
+        self.shim = request
+
+
+def test_rgb_intrinsics_are_rescaled_to_the_delivered_resolution():
+    """android_sensors reports intrinsics at the RGB *sensor* resolution while the
+    encoder delivers a downscaled image, so convert() has to rescale them (the Unity
+    path does this before sending). Without the rescale fx/cx are off by the ratio
+    and the principal point lands nowhere near the centre of the delivered image.
+
+    Checked through the replay dumper because the 9-tuple carries no intrinsics.
+    """
+    from server.illixr_ingress import _rgb_intrinsics_resolution
+
+    anchor_w, anchor_h = _rgb_intrinsics_resolution()
+    delivered = 960
+    assert delivered != anchor_w, "fixture must differ from the anchor or the branch never runs"
+
+    rng = np.random.default_rng(1)
+    f = _fake_frame(image=rng.integers(0, 256, size=(delivered, delivered, 3), dtype=np.uint8))
+    wire_fx, wire_fy, wire_cx, wire_cy = (float(v) for v in f["intrinsics"])
+
+    conv = IllixrFrameConverter()
+    conv._dumper = _RecordingDumper()          # dataset.enabled path, without a real server
+    assert conv.convert(f) is not None
+
+    got = conv._dumper.shim.intrinsics
+    sx, sy = delivered / anchor_w, delivered / anchor_h
+    assert got.fx == pytest.approx(wire_fx * sx)
+    assert got.fy == pytest.approx(wire_fy * sy)
+    assert got.cx == pytest.approx(wire_cx * sx)
+    assert got.cy == pytest.approx(wire_cy * sy)
+
+    # The point of the rescale: the principal point sits at the centre of the image
+    # that was actually delivered, not of the sensor it was measured on.
+    assert got.cx / delivered == pytest.approx(0.5, abs=0.01)
+    assert got.cy / delivered == pytest.approx(0.5, abs=0.01)
+
+    # intrinsics.json has to describe the pixels in decoded_jpg/, so the shim
+    # records the delivered size rather than the reported sensor size.
+    assert (conv._dumper.shim.image_width, conv._dumper.shim.image_height) == (delivered, delivered)
+
+
+def test_depth_intrinsics_are_not_rescaled():
+    """Only RGB is downscaled by the encoder; the depth map arrives at native
+    resolution, so its intrinsics must pass through untouched."""
+    rng = np.random.default_rng(2)
+    f = _fake_frame(image=rng.integers(0, 256, size=(960, 960, 3), dtype=np.uint8))
+    wire = [float(v) for v in f["depth_intrinsics"]]
+
+    conv = IllixrFrameConverter()
+    conv._dumper = _RecordingDumper()
+    assert conv.convert(f) is not None
+
+    d = conv._dumper.shim.depth_intrinsics
+    assert [d.fx, d.fy, d.cx, d.cy] == pytest.approx(wire)
+    assert (conv._dumper.shim.depth_width, conv._dumper.shim.depth_height) == (DEPTH_W, DEPTH_H)
 
 
 if __name__ == "__main__":
