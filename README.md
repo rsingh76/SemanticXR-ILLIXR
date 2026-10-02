@@ -145,6 +145,20 @@ semantic-slam-server/
 
 ## Installation
 
+> **Recommended:** `scripts/setup_conda_env.sh` builds a verified conda environment
+> (CUDA 12.8, PyTorch 2.7, works on Blackwell GPUs) in one step. See
+> [docs/CONDA_SETUP.md](docs/CONDA_SETUP.md) for what it does and the list of
+> problems it works around. The manual steps below describe the original
+> PyTorch 2.0.1 / CUDA 11.8 stack, which has no kernels for Blackwell GPUs and
+> has known conflicts with current dependency versions.
+>
+> **Docker (no environment build needed):** on a new machine run `./sxr setup`
+> once (checks the host, gets the environment image, downloads model weights,
+> self-tests), then `docker compose up` to start the live Quest server. The
+> container runs the code of your git checkout, so `git pull` + `docker compose up`
+> is the whole update cycle. Images can optionally be shared through any container
+> registry (`./sxr setup --registry <host/namespace>`). See [docs/DOCKER.md](docs/DOCKER.md).
+
 ### Dependencies Setup
 
 1. Create a new conda environment with Python 3.10:

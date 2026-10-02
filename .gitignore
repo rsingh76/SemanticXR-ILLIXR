@@ -42,3 +42,17 @@ server/xr_service_pb2_grpc.py
 
 # Generated visualization images (scripts/visualize_e2e.py)
 /outputs/
+
+# Default docker-compose volume root (models + run data, see docs/DOCKER.md)
+/docker-volumes/
+
+# Per-machine Docker settings written by ./sxr setup (may contain a private registry path)
+.env
+# Organisation-internal notes (e.g. private registry instructions); never committed
+/internal/
+
+# Run outputs / scratch written into the checkout by native and Docker runs
+/live_output/
+/output/
+/main_server/
+slam/services/output_audio.wav
