@@ -1,0 +1,121 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# SemanticXR server. Full docs: docs/DOCKER.md
+#
+# The image holds only the ENVIRONMENT (Python, CUDA extensions, Grounded-SAM, RAM).
+# The SemanticXR code is THIS git checkout, mounted at /workspace: whatever
+# branch/commit/edits you have here is what runs. No rebuild for code changes.
+#
+# ---------------------------------------------------------------------------
+# Everyday commands (run from this directory)
+# ---------------------------------------------------------------------------
+#   docker compose up                    start the server (foreground; Ctrl+C stops + saves map)
+#   docker compose up -d                 same, in the background
+#   docker compose logs -f               follow the log of a background server
+#   docker compose down                  stop a background server
+#   docker compose config                print the fully resolved setup (check your edits here)
+#   docker compose run --rm semanticxr verify            GPU + model self-test
+#   docker compose run --rm semanticxr replay dataset_0  replay a captured Quest session
+#   docker compose run --rm semanticxr bash              shell inside the container
+#   ./sxr update                         after a git pull that changed dependencies
+#                                        (the container tells you when that is needed)
+#
+# ---------------------------------------------------------------------------
+# How to change things  -- most settings are ${VAR:-default}
+# ---------------------------------------------------------------------------
+#  * Per-machine settings live in `.env` next to this file (written by
+#    `./sxr setup`, gitignored, one VAR=value per line); compose reads it
+#    automatically, so this file stays identical on every machine:
+#        SXR_CONFIG=config/debug/quest_debug_mobileclip.yaml
+#        SXR_MODELS_DIR=/big/disk/semanticxr/models
+#  * Or set one for a single run:  SXR_CONFIG=... docker compose up
+#  * Code, config/*.yaml, this file and .env: edit, then `docker compose up`.
+#    Only dependency changes (Dockerfile, scripts/conda/*.txt, scripts/patches/)
+#    need a new image: `./sxr update`.
+
+services:
+  semanticxr:
+    # Environment image. `./sxr update` points this tag at the image that matches
+    # the checkout's dependencies (pulled from your registry or built locally).
+    image: ${SXR_IMAGE:-semanticxr-env:local}
+
+    build:
+      context: .
+      target: env
+      args:
+        # GPU generations to compile the CUDA extensions for. Fewer = faster build:
+        #   8.0 A100 | 8.6 RTX 30xx / A-series | 8.9 RTX 40xx / L40 | 9.0 H100
+        #   10.0 B200 | 12.0 RTX 50xx / RTX PRO Blackwell
+        # e.g. only this machine's GPU:  SXR_ARCH=12.0 ./sxr build
+        TORCH_CUDA_ARCH_LIST: ${SXR_ARCH:-8.0;8.6;8.9;9.0;10.0;12.0}
+
+    # WHAT RUNS. The first word is a mode handled by docker/entrypoint.sh:
+    #   ["quest"]              live Quest server:
+    #                          python server/main.py --dataset_type quest --config $SXR_CONFIG --save_map
+    #   ["quest", "--flag"]    same, with extra server/main.py flags appended
+    #                          (e.g. "--pipelined_mapping"; see `python server/main.py --help`)
+    #   ["replay", "dataset_0"]  offline replay of datasets/quest/dataset_0 in this checkout
+    #   ["server", ...args]    run server/main.py with exactly these arguments, e.g.
+    #                          ["server", "--dataset_type", "quest", "--config", "config/defaults.yaml"]
+    #   ["verify"]             self-test, then exit
+    # Use one of these modes rather than ["python", ...]: anything else is run
+    # raw, skipping the model download, GPU check and non-root switch.
+    command: ["quest"]
+
+    environment:
+      # YAML profile for quest/replay (path inside the repo). Also decides which
+      # CLIP / ASR models are pre-downloaded at start. Options in config/, e.g.
+      #   config/debug/quest_debug.yaml            ViT-H-14 CLIP, openai-whisper medium.en
+      #   config/debug/quest_debug_mobileclip.yaml MobileCLIP-B (faster)
+      SXR_CONFIG: ${SXR_CONFIG:-config/debug/quest_debug.yaml}
+      # 1 = never download models (offline site with a pre-filled SXR_MODELS_DIR)
+      SXR_SKIP_FETCH: ${SXR_SKIP_FETCH:-0}
+      # 0 = only download the 4 checkpoints at start; CLIP/BERT/ASR load lazily on first use
+      SXR_PREFETCH: ${SXR_PREFETCH:-1}
+      # 1 = start even if the image was built for different dependencies than this checkout
+      SXR_IGNORE_ENV_MISMATCH: ${SXR_IGNORE_ENV_MISMATCH:-0}
+      # needed only for asr.backend: "openai-api" in the YAML
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      # Run as a specific host user (default: owner of this checkout). Uncomment to force:
+      # SXR_UID: "1000"
+      # SXR_GID: "1000"
+
+    gpus: all            # or e.g. `device_ids: ["0"]` under deploy.resources to pin one GPU
+
+    # NETWORK. "HOST:CONTAINER". Only change the left (host) number; the headset
+    # must then use that number. The right side is fixed by the server.
+    # Prefix with 127.0.0.1: (e.g. "127.0.0.1:50051:50051") to accept only local
+    # / SSH-tunnelled connections. Note: Docker bypasses ufw, so a published
+    # port is open to whatever your cloud firewall / security group allows.
+    ports:
+      - "${SXR_STREAM_PORT:-50051}:50051"   # Quest frame stream (XrService)
+      - "${SXR_QUERY_PORT:-50054}:50054"    # Quest voice/text queries (VisualizerServer)
+
+    # STORAGE. "HOST_DIR:CONTAINER_DIR".
+    volumes:
+      # The code: this checkout. Outputs land here too, exactly like a native run:
+      #   live_output/quest/run_N/  datasets/quest/dataset_N/  output/<type>/<scene>/
+      - .:/workspace
+      # ~14 GB: checkpoints (gsa/), Hugging Face + whisper caches. Shared by all
+      # checkouts on this machine; `./sxr setup` creates it and sets the path in
+      # .env. No default on purpose: a folder Docker creates on the fly is
+      # root-owned, so compose refuses to start until setup has run.
+      - ${SXR_MODELS_DIR:?run ./sxr setup first (it sets SXR_MODELS_DIR in .env)}:/models
+      # Uncomment to replay Replica (then: command: ["server", "--dataset_type",
+      # "replica", "--localDataset", "--sceneName", "room0", "--save_map"] and
+      # REPLICA_ROOT: /replica under environment):
+      # - /path/to/Replica:/replica:ro
+
+    # ---- Runtime plumbing: normally leave as is -------------------------------
+    # The pipeline passes frames between processes through multiprocessing
+    # queues; Docker's default 64 MB /dev/shm is far too small.
+    shm_size: "16gb"
+    # Reaps the inference / mapping / visualization worker processes.
+    init: true
+    # Docker's default is 10 s before SIGKILL; --save_map dumps the semantic map
+    # on shutdown, which can take longer for big scenes.
+    stop_grace_period: 60s
+    # Keep a TTY so Ctrl+C in `docker compose up` reaches the server.
+    stdin_open: true
+    tty: true

@@ -1,0 +1,35 @@
+# The image builds its own external/ (patched GSA + RAM) and must not receive the
+# host copy (multi-GB checkpoints, host-compiled .so files).
+external/
+model_weights/
+
+# Runtime data / outputs (go to the /data volume)
+datasets/
+live_output/
+output/
+outputs/
+main_server/
+**/debug_dumps/
+**/logs_performance/
+
+# Generated gRPC stubs are regenerated inside the image
+server/xr_service_pb2*.py
+server/xr_service_pb2*.pyi
+slam/protocols/vis_proto/vis_pb2*.py
+slam/protocols/vis_proto/vis_pb2*.pyi
+
+# Python / tooling noise
+**/__pycache__/
+**/*.pyc
+*.egg-info/
+.venv/
+.pytest_cache/
+.git/
+.vscode/
+*.log
+
+# Default docker-compose volume root (models + run data)
+docker-volumes/
+.env
+internal/
+slam/services/output_audio.wav

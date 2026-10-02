@@ -1,0 +1,25 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Release image = an existing environment image + a frozen copy of the code.
+# Built by `./sxr release` on top of the exact environment image for this
+# checkout (pulled or built), so it never recompiles the environment.
+# For sites that should run a fixed version without a git checkout.
+ARG ENV_IMAGE=semanticxr-env:local
+FROM ${ENV_IMAGE}
+COPY . /workspace
+# - gRPC stubs (generated, gitignored)
+# - run outputs (./datasets, ./live_output, ./output) -> /data volume
+# - scratch files the code writes inside the source tree -> /tmp, so the server
+#   can run as a non-root user (DOCKER.md D4)
+RUN cd /workspace/slam/protocols/vis_proto && python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. vis.proto \
+    && cd /workspace/server && python -m grpc_tools.protoc -I. --python_out=. --grpc_python_out=. xr_service.proto \
+    && cd /workspace \
+    && rm -rf datasets live_output output main_server \
+    && ln -sfn /data/datasets datasets \
+    && ln -sfn /data/live_output live_output \
+    && ln -sfn /data/output output \
+    && ln -sfn /tmp/main_server main_server \
+    && ln -sfn /tmp/output_audio.wav slam/services/output_audio.wav \
+    && touch /workspace/.sxr-release
+VOLUME ["/data"]
