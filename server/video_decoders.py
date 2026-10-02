@@ -49,9 +49,12 @@ class VideoDecoder:
         ):
             data = _NAL_START_CODE + data
 
+        # PyNvVideoCodec >= 2.0 takes the bitstream as a raw pointer (int), not
+        # bytes. ``buf`` must stay alive until Decode() returns.
+        buf = np.frombuffer(data, dtype=np.uint8)
         pkt = nvc.PacketData()
-        pkt.bsl_data = data
-        pkt.bsl = len(data)
+        pkt.bsl_data = buf.ctypes.data
+        pkt.bsl = buf.size
         decoded = self._decoder.Decode(pkt)
         frames = []
         for f in decoded:

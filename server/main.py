@@ -322,7 +322,8 @@ def _process_replica_dataset(inferenceQueue, args, config, datasetName, paths):
         clientFrameNumber = frame_number
         clientTimeStamps = time.perf_counter_ns()
 
-        inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose, clientFrameNumber, clientTimeStamps, clientTimeStamps, {}))
+        # 9th slot = per-frame max_depth_m; None -> inference_consumer falls back to the dataset YAML.
+        inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose, clientFrameNumber, clientTimeStamps, clientTimeStamps, {}, None))
         time.sleep(1 / config.server.target_fps)
     
     _send_completion_signal(inferenceQueue, datasetName, num_frames)
@@ -366,7 +367,8 @@ def _process_scannet_dataset(inferenceQueue, args, config, datasetName, paths):
         clientFrameNumber = i
         clientTimeStamps = time.perf_counter_ns()
 
-        inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose, clientFrameNumber, clientTimeStamps, clientTimeStamps, {}))
+        # 9th slot = per-frame max_depth_m; None -> inference_consumer falls back to the dataset YAML.
+        inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose, clientFrameNumber, clientTimeStamps, clientTimeStamps, {}, None))
         time.sleep(1 / config.server.target_fps)
     
     _send_completion_signal(inferenceQueue, datasetName, num_frames)
@@ -452,8 +454,9 @@ def _process_quest_dataset(inferenceQueue, args, config, datasetName, paths):
         clientFrameNumber = i
         clientTimeStamps = time.perf_counter_ns()
 
+        # 9th slot = per-frame max_depth_m; None -> inference_consumer falls back to the dataset YAML.
         inferenceQueue.put((imagePIL, np.array(imagePIL), depthArray, pose,
-                            clientFrameNumber, clientTimeStamps, clientTimeStamps, {}))
+                            clientFrameNumber, clientTimeStamps, clientTimeStamps, {}, None))
         time.sleep(1 / config.server.target_fps)
 
     _send_completion_signal(inferenceQueue, datasetName, num_frames)
