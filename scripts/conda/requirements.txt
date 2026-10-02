@@ -1,0 +1,74 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Pure-Python / wheel dependencies for the conda environment (scripts/setup_conda_env.sh).
+# torch + torchvision are installed first from the cu128 index; the source-built
+# CUDA extensions (pytorch3d, chamferdist, groundingdino, gradslam, ...) are built
+# by the script and are NOT listed here. Always install with
+#   pip install -c scripts/conda/constraints.txt -r scripts/conda/requirements.txt
+# See docs/CONDA_SETUP.md for the reason behind every pin marked [Issue N].
+
+# --- core pipeline ---------------------------------------------------------
+# [Issue 6] supervision 0.14.0 hard-requires opencv-python-headless, the code
+# wants the GUI build. Both at the SAME version; setup script re-installs
+# opencv-python last so cv2 comes from the GUI wheel.
+opencv-python==4.10.0.84
+opencv-python-headless==4.10.0.84
+Pillow>=9.5.0
+supervision==0.14.0
+kornia==0.7.3
+# [Issue 9] open_clip's MobileCLIP (fastvit_mci) needs timm>=1.0; the README's
+# timm==0.4.12 breaks every *mobileclip* config. RAM's old timm import paths
+# still resolve under 1.0.x through timm's deprecation shims.
+timm==1.0.11
+# Old-but-working: the repo/RAM/GroundingDINO were written against 4.25.
+transformers==4.25.1
+open-clip-torch>=2.26.0
+distinctipy>=1.3.0
+natsort>=8.4.0
+ftfy>=6.2.0
+fairscale>=0.4.4
+addict>=2.4.0
+yapf
+pycocotools
+fvcore>=0.1.5
+iopath>=0.1.9
+faiss-cpu>=1.7.4
+open3d>=0.18.0
+scipy>=1.10.0,<1.15.0
+scikit-learn>=1.5.0
+matplotlib>=3.9.0
+pandas
+seaborn
+h5py>=3.11.0
+imageio>=2.34.0
+tqdm>=4.65.0
+
+# --- config / logging / clients ---------------------------------------------
+pyyaml>=6.0
+omegaconf>=2.3.0
+hydra-core>=1.3.0
+tyro>=0.8.0
+wandb>=0.17.0
+openai>=1.37.0
+
+# --- gRPC server + hardware video decode -----------------------------------
+grpcio>=1.65.0
+grpcio-tools>=1.65.0
+# [Issue 11] >=2.0 takes the bitstream as a pointer; server/video_decoders.py was
+# updated accordingly. 1.x lacks OutputColorType.
+pynvvideocodec>=2.0.0
+
+# --- local ASR backends (the 'asr' extra; defaults.yaml uses faster-whisper) ---
+# openai-whisper additionally needs the ffmpeg binary [Issue 10] (conda-installed).
+openai-whisper
+faster-whisper
+
+# --- build helpers for --no-build-isolation installs [Issue 8] --------------
+ninja
+wheel
+hatchling
+editables
+
+# --- tests ------------------------------------------------------------------
+pytest>=8.0
