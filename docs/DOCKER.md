@@ -149,13 +149,51 @@ fetches missing models (~10 s when nothing is missing).
   builds `semanticxr:X` = environment + code. Run it with
   `docker run --gpus all --shm-size=16g --init -p 50051:50051 -p 50054:50054 -v <models>:/models -v <data>:/data semanticxr:X`;
   outputs go to `<data>`.
-- **No registry, no build at the site:** `docker save semanticxr-env:local | gzip > env.tar.gz`,
-  copy it, then `docker load < env.tar.gz`, `docker tag <loaded image> semanticxr-env:local`.
+- **No registry, no build at the site:** copy the image as a file, see
+  [Copying the image without a registry](#copying-the-image-without-a-registry).
 - **Offline models:** copy a filled models folder and set `SXR_SKIP_FETCH=1`
   (plus `HF_HUB_OFFLINE=1` if the machine has no internet at all).
 - **Native (conda) and Docker on the same checkout** work side by side: both
   write outputs to the same folders, and the generated gRPC stubs are
   compatible (same protobuf version).
+
+## Copying the image without a registry
+
+`docker save` / `docker load` move the environment image as one file (~5.3 GB
+compressed), e.g. via your laptop or directly between machines. The target
+then needs neither a registry nor the ~30 min build.
+
+Export the **fingerprint tag** (`semanticxr-env:<fingerprint>`), not
+`semanticxr-env:local`: `./sxr` looks the image up by fingerprint, so an
+archive that only carries `:local` is not recognised and `./sxr setup` would
+rebuild anyway.
+
+```bash
+# source machine
+./sxr status                                   # "fingerprint : <fingerprint> ..."
+docker save semanticxr-env:<fingerprint> | gzip -1 > semanticxr-env-<fingerprint>.tar.gz
+
+# copy the file (scp / rsync), then on the target machine
+gunzip -c semanticxr-env-<fingerprint>.tar.gz | docker load
+# clone the repo (a commit with the same dependency files), cd into it, then
+./sxr setup                                    # "environment image ... is present": no build, no registry
+docker compose up
+```
+
+Without an intermediate file, from any machine that can SSH to both:
+
+```bash
+ssh <source> 'docker save semanticxr-env:<fingerprint> | gzip -1' | ssh <target> 'gunzip | docker load'
+```
+
+- The target checkout must have the same fingerprint, i.e. the same
+  `Dockerfile`, `scripts/conda/*.txt` and `scripts/patches/` (check with
+  `./sxr status` on both machines). Code-only differences don't matter.
+- Keep the archive: any later machine on the same dependencies can load it.
+- Model weights are not in the image. `./sxr setup` downloads them (~14 GB); for
+  a machine without internet, copy them as well
+  (`rsync -a ~/.cache/semanticxr/models/ <target>:~/.cache/semanticxr/models/`)
+  before running `./sxr setup`.
 
 ---
 
