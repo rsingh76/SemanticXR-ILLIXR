@@ -6,6 +6,7 @@
 import cv2
 import os
 import tempfile
+import traceback
 from typing import Tuple, Optional
 import numpy as np
 from PIL import Image
@@ -45,7 +46,16 @@ class VideoProcessor:
         if not os.path.exists(self.temp_output_dir):
             os.makedirs(self.temp_output_dir)
         self._cleanup_temp_directory()
-    
+
+    def reset_decoders(self) -> None:
+        """Start both decoders from a clean state (call at session start).
+
+        The decoders are shared by every gRPC stream, so two clients streaming
+        at the same time would still interfere with each other.
+        """
+        self.h264_decoder.reset()
+        self.h265_decoder.reset()
+
     def _cleanup_temp_directory(self) -> None:
         """Clean up temporary output directory."""
         if os.path.exists(self.temp_output_dir):
@@ -111,37 +121,52 @@ class VideoProcessor:
         
         return image_path, depth_path
     
-    def process_video_frame(self, frame_data: bytes, codec: str = 'h264') -> Tuple[Optional[np.ndarray], bool]:
-        """Process raw video frame data.
+    def process_video_frame(self, frame_data: bytes, frame_number: int, codec: str = 'h264',
+                            keep: bool = True) -> Tuple[Optional[np.ndarray], Optional[str]]:
+        """Decode one message's video packet and check the image belongs to it.
 
         Args:
-            frame_data: Raw video frame bytes
+            frame_data: Encoded bytes of exactly one picture.
+            frame_number: The message's client frame number. It rides through
+                the decoder as the pts; the returned image must carry it back.
             codec: 'h264' (iPad / dataset streams) or 'h265' (Meta Quest).
+            keep: False for frames that will be skipped. They are still decoded
+                (later pictures reference earlier ones) but not copied off the GPU.
 
         Returns:
-            Tuple of (processed_frame, is_valid). ``is_valid`` is the
-            Laplacian-variance sharpness gate used to reject hand-shake blur on
-            iPad streams. Quest is head-mounted with VIO, and its H.265
-            compression produces much lower Laplacian variance even on crisp
-            content (~18 vs ~>>100 for iPad). The gate was never meaningful for
-            Quest, so we bypass it when codec=='h265'.
+            Tuple of (image, reject_reason). ``reject_reason`` is None when the
+            image is usable, otherwise "<category>: <detail>". The sharpness gate
+            rejects hand-shake blur on iPad streams only: Quest is head-mounted
+            with VIO, and its H.265 compression produces much lower Laplacian
+            variance even on crisp content (~18 vs ~>>100 for iPad), so the gate
+            is bypassed when codec=='h265'.
         """
+        decoder = self.h265_decoder if codec == 'h265' else self.h264_decoder
         try:
-            decoder = self.h265_decoder if codec == 'h265' else self.h264_decoder
-            decoded_frames = decoder.decode_frame(frame_data)
-            
-            if not decoded_frames:
-                return None, False
-            
-            # Get the first frame (numpy array, RGB HWC, from NVDEC)
-            decoded_frame = decoded_frames[0]
-            
-            # Sharpness gate: skip for Quest (see docstring).
-            if codec != 'h265' and not self.is_frame_sharp_enough(decoded_frame):
-                return decoded_frame, False
-
-            return decoded_frame, True
-            
+            decoded = decoder.decode(frame_data, pts=frame_number, to_host=keep)
         except Exception as e:
-            print(f"Error processing video frame: {e}")
-            return None, False
+            traceback.print_exc()
+            return None, f"decoder exception: {type(e).__name__}: {e}"
+
+        if not decoded:
+            return None, "no image from decoder: the packet produced no picture"
+
+        matching = [d for d in decoded if d.pts == frame_number]
+        if not matching:
+            return None, (f"timestamp mismatch: decoder returned frame(s) "
+                          f"{[d.pts for d in decoded]} for message {frame_number}")
+        if len(decoded) > 1:
+            print(f"⚠️  [VIDEO] decoder returned {len(decoded)} images for message {frame_number}; "
+                  f"dropped frame(s) {[d.pts for d in decoded if d.pts != frame_number]}")
+
+        image = matching[0].image
+        if not keep:
+            return None, None
+
+        # Sharpness gate: skip for Quest (see docstring).
+        if codec != 'h265':
+            sharpness = self.calculate_sharpness(image)
+            if sharpness < self.sharpness_threshold:
+                return image, f"blurry: sharpness {sharpness:.1f} < {self.sharpness_threshold}"
+
+        return image, None

@@ -6,6 +6,8 @@
 import json
 import os
 import time
+import traceback
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
@@ -75,6 +77,23 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
         # incoming frames will be Quest or iPad until it sees one.
         self.data_dump_enabled = self.config.dataset.enabled
         self._capture_roots: dict = {}  # dataset_type ('quest'/'ipad') -> capture dir path
+        self._reject_counts: Counter = Counter()  # rejection category -> count, per session
+
+    def _start_session(self) -> None:
+        """Reset per-session decode state at the top of every upload stream."""
+        self.video_processor.reset_decoders()
+        self._reject_counts.clear()
+
+    def _reject(self, client_frame_number: int, reason: str, log: bool = True) -> None:
+        """Count a rejected frame under its category ("<category>: <detail>")."""
+        self._reject_counts[reason.split(":", 1)[0]] += 1
+        if log:
+            print(f"Frame {client_frame_number} rejected: {reason}")
+
+    def _rejection_summary(self) -> str:
+        if not self._reject_counts:
+            return "no rejections"
+        return "rejected: " + ", ".join(f"{k} x{v}" for k, v in self._reject_counts.most_common())
 
     def _resolve_client_fps(self, request) -> Optional[int]:
         """Translate the proto's int ``fps`` field to Optional[int].
@@ -290,6 +309,7 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             Upload response or None if processing failed
         TODO:: check if this is correct!!!!!!!!!!!!! Very last minute change!!!!!!!!!!!!! (Seems ok for now? -- Jan 6th 2026)
         """
+        client_frame_number = -1  # for the rejection log if parsing the request itself fails
         try:
             # Extract frame data (same for both message types)
             client_frame_number = request.image.frame_number
@@ -301,9 +321,10 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             # than the YAML default. No-op after frame 1 of the session.
             self.inference_service.note_client_fps(self._resolve_client_fps(request))
 
-            # Check if frame should be processed
-            if not self.inference_service.should_process_frame(client_frame_number):
-                return xr_service_pb2.VideoStatus(success=True)
+            # Decide now whether this frame goes to inference, but decode it
+            # either way: later pictures reference earlier ones, so a packet the
+            # decoder never sees corrupts every picture until the next keyframe.
+            process_frame = self.inference_service.should_process_frame(client_frame_number)
 
             # Pull the encoded video bytes. The proto field is named ``data_h265``
             # for historical reasons: iPad / dataset streams are actually H.264,
@@ -316,10 +337,15 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             image_array = None
             if video_data:
                 codec = 'h265' if is_quest else 'h264'
-                processed_frame, is_valid = self.video_processor.process_video_frame(video_data, codec=codec)
+                processed_frame, reject_reason = self.video_processor.process_video_frame(
+                    video_data, client_frame_number, codec=codec, keep=process_frame)
 
-                if not is_valid:
-                    print(f"Frame {client_frame_number} rejected (quality check)")
+                if not process_frame:
+                    if reject_reason is not None:
+                        print(f"Frame {client_frame_number} (skipped) decode problem: {reject_reason}")
+                    return xr_service_pb2.VideoStatus(success=True)
+                if reject_reason is not None:
+                    self._reject(client_frame_number, reject_reason)
                     return xr_service_pb2.VideoStatus(success=False)
 
                 # processed_frame should be the decoded image
@@ -330,6 +356,8 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
                     elif isinstance(processed_frame, np.ndarray):
                         image_array = processed_frame
                         image_pil = Image.fromarray(processed_frame)
+            elif not process_frame:
+                return xr_service_pb2.VideoStatus(success=True)
 
             # Convert depth data - different formats for dataset vs regular vs quest
             if is_quest:
@@ -348,8 +376,9 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
                     request.depth_near_z,
                 )
                 if depth_native is None:
-                    print(f"Frame {client_frame_number} rejected (quest depth size mismatch: "
-                          f"{len(request.depth)} B for {request.depth_width}x{request.depth_height})")
+                    self._reject(client_frame_number,
+                                 f"quest depth size mismatch: {len(request.depth)} B for "
+                                 f"{request.depth_width}x{request.depth_height}")
                     return xr_service_pb2.VideoStatus(success=False)
             elif is_dataset:
                 # Dataset format: bytes depth
@@ -369,8 +398,9 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
                 rgb_pose_values = list(request.rgb_camera_pose)
                 depth_pose_values = list(request.depth_pose)
                 if len(rgb_pose_values) != 16 or len(depth_pose_values) != 16:
-                    print(f"Frame {client_frame_number} rejected (quest pose missing: "
-                          f"rgb_camera_pose={len(rgb_pose_values)} depth_pose={len(depth_pose_values)})")
+                    self._reject(client_frame_number,
+                                 f"quest pose missing: rgb_camera_pose={len(rgb_pose_values)} "
+                                 f"depth_pose={len(depth_pose_values)}")
                     return xr_service_pb2.VideoStatus(success=False)
                 pose_data = [client_frame_number] + rgb_pose_values
             elif is_dataset:
@@ -457,11 +487,13 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             if success:
                 return xr_service_pb2.VideoStatus(success=True)
             else:
+                # submit_inference_request already printed why (queue full or error).
+                self._reject(client_frame_number, "inference submit failed", log=False)
                 return xr_service_pb2.VideoStatus(success=False)
 
         except Exception as e:
-            error_msg = f"Error processing frame: {e}"
-            print(error_msg)
+            traceback.print_exc()
+            self._reject(client_frame_number, f"exception: {type(e).__name__}: {e}")
             return xr_service_pb2.VideoStatus(success=False)
     
     def UploadSyncMessage(self, 
@@ -476,6 +508,7 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
         Returns:
             Single VideoStatus response
         """
+        self._start_session()
         success_count = 0
         total_count = 0
         
@@ -487,6 +520,8 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
         
         # Return a single VideoStatus indicating overall success
         overall_success = success_count == total_count and total_count > 0
+        print(f"Upload processing completed: {success_count}/{total_count} frames successful "
+              f"({self._rejection_summary()})")
         return xr_service_pb2.VideoStatus(success=overall_success)
     
     def UploadSyncMessage_quest(self,
@@ -508,6 +543,7 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             Single VideoStatus response
         """
         print(f"\n\n\n GRPC Server: UploadSyncMessage_quest called")
+        self._start_session()
         success_count = 0
         total_count = 0
 
@@ -526,7 +562,8 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
             self._send_scene_completion_on_disconnect(total_count)
 
         overall_success = success_count == total_count and total_count > 0
-        print(f"Quest processing completed: {success_count}/{total_count} frames successful")
+        print(f"Quest processing completed: {success_count}/{total_count} frames successful "
+              f"({self._rejection_summary()})")
         return xr_service_pb2.VideoStatus(success=overall_success)
 
     def _allocate_next_run_dir(self) -> Optional[Path]:
@@ -617,7 +654,8 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
         Returns:
             Single VideoStatus response
         """
-        print(f"\n\n\n GRPC Server: UploadSyncMessage_dataset called")  
+        print(f"\n\n\n GRPC Server: UploadSyncMessage_dataset called")
+        self._start_session()
         success_count = 0
         total_count = 0
         
@@ -630,7 +668,8 @@ class SLAMGRPCServer(xr_service_pb2_grpc.XrServiceServicer):
         
         # Return a single VideoStatus indicating overall success
         overall_success = success_count == total_count and total_count > 0
-        print(f"Dataset processing completed: {success_count}/{total_count} frames successful")
+        print(f"Dataset processing completed: {success_count}/{total_count} frames successful "
+              f"({self._rejection_summary()})")
         return xr_service_pb2.VideoStatus(success=overall_success)
                 
     def get_server_stats(self) -> dict:

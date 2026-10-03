@@ -169,6 +169,31 @@ def serve(inferenceQueue, target_fps, config=None):
     server.wait_for_termination()
 
 
+def report_code_origin():
+    """Print where the server's packages were imported from.
+
+    An editable install of another checkout (e.g. in an older conda env) can
+    win over this one, so this main.py would silently run someone else's code.
+    """
+    import importlib
+    repo_root = Path(__file__).resolve().parent.parent
+    print(f"🔎 Code origin (expected under {repo_root}):")
+    foreign = []
+    for name in ("server", "slam", "config"):
+        pkg_dir = Path(importlib.import_module(name).__file__).resolve().parent
+        print(f"   {name:<8} {pkg_dir}")
+        if repo_root not in pkg_dir.parents:
+            foreign.append(name)
+    gsa = os.environ.get("GSA_PATH")
+    note = "" if not gsa or repo_root in Path(gsa).resolve().parents else "  (outside this checkout)"
+    print(f"   GSA_PATH {gsa or '<unset>'}{note}")
+    latency = getattr(importlib.import_module("server.video_decoders"), "DECODE_LATENCY", None)
+    print(f"   video decoder latency: {latency.name if latency is not None else 'unknown'}")
+    if foreign:
+        print(f"⚠️  {', '.join(foreign)} imported from OUTSIDE {repo_root}: this run is not using "
+              f"this checkout's code. Check the active env for an editable install of another checkout.")
+
+
 def get_parser():
     """Streamlined argument parser - model configs moved to YAML files."""
     parser = argparse.ArgumentParser(description='XR Scene Builder Server')
@@ -494,7 +519,8 @@ if __name__ == '__main__':
     # Apply command line overrides
     config = apply_config_overrides(config, args)
     set_config(config)
-    
+    report_code_origin()
+
     # print(f"🎯 Configuration Summary:")
     # print(f"   Server: {config.server.host}:{config.server.port} (FPS: {config.server.target_fps})")
     # print(f"   Detection device: {config.model.detection.device}")

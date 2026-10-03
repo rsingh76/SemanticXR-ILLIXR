@@ -5,6 +5,7 @@
 
 import time
 import multiprocessing
+import traceback
 from typing import Optional, Tuple, Any
 from queue import Queue
 import numpy as np
@@ -148,6 +149,7 @@ class InferenceService:
             return True
             
         except Exception as e:
+            traceback.print_exc()
             print(f"Error submitting inference request: {e}")
             return False
     
